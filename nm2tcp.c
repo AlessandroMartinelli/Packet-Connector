@@ -25,7 +25,7 @@
 
 
 #define NETMAP_WITH_LIBS
-#include <net/netmap_user.h>
+//#include <net/netmap_user.h>
 
 #include "nm2tcp.h"
 

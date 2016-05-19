@@ -12,10 +12,13 @@ endif
 SRCS= nm2tcp.c nm_sess.c
 OBJS= $(SRCS:%.c=%.o)
 CLEANFILES = $(PROGS) $(OBJS)
+BUILDFLDR = build/
 
 LDFLAGS += $(LDLIBS)
 
 all: $(PROGS)
+	mv *.o $(BUILDFLDR)
+	mv $(PROGS) $(BUILDFLDR)
 
 nm2tcp.o: nm2tcp.h
 nm_sess.o: nm2tcp.h
@@ -24,4 +27,4 @@ nm2tcp: nm2tcp.o nm_sess.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
-	-@rm -rf $(CLEANFILES)
+	rm -rf $(BUILDFLDR)*

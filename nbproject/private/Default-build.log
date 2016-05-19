@@ -1,0 +1,6 @@
+cc -O3 -pipe -I ../../sys -Werror -Wall -Wunused-function -Wextra   -c -o nm2tcp.o nm2tcp.c
+nm2tcp.c:28:29: fatal error: net/netmap_user.h: No such file or directory
+ #include <net/netmap_user.h>
+                             ^
+compilation terminated.
+make: *** [nm2tcp.o] Error 1
