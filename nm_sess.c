@@ -104,8 +104,10 @@ do_socket(const char *_addr, int nonblock, int *client)
 	D("missing port number in %s", _addr);
 	goto error;
     }
-    port[0] = '\0';
+    port[0] = '\0'; /*trick: divide the port from the addr*/
     if (port == addr) {
+        /* if port == addr, it means that the addr contains no IP:
+         * the mode in this case is: "server" (*client=0) */
 	ND("port == addr");
 	s.sin_addr.s_addr = INADDR_ANY;
 	*client = 0;

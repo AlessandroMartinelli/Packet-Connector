@@ -615,10 +615,15 @@ f_tcp_body(void *_f) /* read */
 	ND("mode for %d is %s", t->id, client ? "client" : "server");
 	if (!client) {
 	    t->listen_fd = t->fd;
-	    t->fd = -1;
+            /* defensive programming: fd is not consistent if in server
+             * mode at this stage */
+	    t->fd = -1; 
 	}
 	t->ready = 1;
 	if (f->n_chains == 2) {
+            /* if the second chain is active, clone file descriptors from
+             * the twins. The handler of the created thread is the same as the
+             * one for the corresponding twin. */
 	    t[2].fd = t->fd;
 	    t[2].listen_fd = t->listen_fd;
 	    pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
@@ -632,6 +637,9 @@ f_tcp_body(void *_f) /* read */
     } else { /* server mode, base does accept, twin waits for fd */
     	for (;;) {
 	    D("III running %d in server mode on fd %d", t->id, t->listen_fd);
+            /* if the current thread is the one who opened the connection
+             * it retrieves the fd doing the accept; otherwise it retrieves fd
+             * from its twin */
 	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;
 	    if (t->fd < 0) {
 		D("accept failed, retry");
