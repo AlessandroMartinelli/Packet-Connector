@@ -49,8 +49,8 @@ a bidirectional communication.
 struct test_t {
     struct pcq_t dumpq;	/* a copy of the queue */
     struct pcq_t *q; /* pointer to the original queue */
-    volatile uint64_t bctr;
-    volatile uint64_t pctr;
+    volatile uint64_t bctr; /* byte counter transfered */
+    volatile uint64_t pctr; /* packet counter transfered */
     volatile uint64_t bctr_old;	/* saved value */
     volatile uint64_t pctr_old;	/* saved value */
     volatile uint64_t stop;
@@ -290,7 +290,7 @@ f_tcp_body(void *_f)
     void *(*cb)(struct my_td *) = (t->id == 0 || t->id == 3) ? f_tcp_read : f_tcp_write;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
-	t->id == 0 || t->id == 2 ? "read" : "write", t->id);
+	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
     my_td_init(t);
 
     if (t->q->capacity < 8 * MY_MAX_PKTLEN) {
@@ -359,7 +359,7 @@ f_test_body(void *_f)
     int mode = f->mode;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
-	t->id == 0 || t->id == 2 ? "prod" : "cons", t->id);
+	t->id == 0 || t->id == 3 ? "prod" : "cons", t->id);
     my_td_init(t);
     d = t->data;
     t->ready = 1;
@@ -372,7 +372,7 @@ f_test_body(void *_f)
 	struct q_pkt_hdr *h;
 	char *buf = (char *)(q->store);
 
-	if (t->id == 1) { /* consumer */
+	if (t->id == 1 || t->id == 2) { /* consumer */
 	    index_t avail, need;
 	    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->cons_ci));
 
@@ -473,7 +473,7 @@ main(int ac, char **av)
     t = f->td;
     f->n_chains = 1; /* unidirectional */
     f->qlen = 1<<18;	/* 16M */
-    f->mode = 3;
+    f->mode = 0;
     f->obj_size = 0;
     t[0].pkt_len = 1500;
 
@@ -531,7 +531,7 @@ main(int ac, char **av)
 	if (x->prefix == NULL) {
 	    usage();
 	}
-	t[i].handler = x->handler;
+	t[i].handler = t[i].twin->handler = x->handler;
 	f->port[i].name = av[i];
     }
 
@@ -540,8 +540,8 @@ main(int ac, char **av)
     for (i = 0; i < f->n_chains; i++) { /* create one queue per chain */
 	t[2*i].q = t[2*i+1].q = f->q[i] = pcq_new(f->qlen, f->obj_size);
     }
-    for (i = 0; i < 2; i++) { /* create one thread per endpoint */
-	t[i].core = f->base_core + 2 * i;
+    for (i = 0; i < 2*f->n_chains; i++) { /* create one thread per endpoint */
+	t[i].core = f->base_core + i;
 	pthread_create(&t[i].td_id, NULL, t[i].handler, t+i);
     }
 
@@ -553,7 +553,9 @@ main(int ac, char **av)
 	    if (t[i].ready == 1) t[i].pr_stat(&t[i]);
 	    if (t[i].ready == 2) {
 		D("JOIN thread %d, %s", i, t[i].name);
-		pthread_join(t[i].td_id, NULL); t[i].ready = 3;}
+		pthread_join(t[i].td_id, NULL);
+                t[i].ready = 3;
+            }
 	    if (t[i].ready != 3) waiting++;
 	}
 	if (waiting == 0) break;
