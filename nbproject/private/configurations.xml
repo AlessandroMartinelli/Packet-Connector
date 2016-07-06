@@ -4,9 +4,10 @@
     <df root="." name="0">
       <df name="build">
       </df>
-      <in>nm2tcp.c</in>
-      <in>nm2tcp.h</in>
-      <in>nm_sess.c</in>
+      <in>pconn.c</in>
+      <in>pconn.h</in>
+      <in>pcq.h</in>
+      <in>sess.c</in>
     </df>
   </logicalFolder>
   <projectmakefile>GNUmakefile</projectmakefile>

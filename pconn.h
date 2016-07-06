@@ -24,18 +24,11 @@
  */
 
 /*
- * common headers for nm2tcp gateway
+ * common headers for packet connectors
  */
 
-#define Q_ALIGN	8
-/* TCP buffers 64k and above do not make a lot of difference */
-#define MY_TCP_BUFLEN	(1<<18)
-#define MY_Q_BUFLEN	(1000000)
-#define MY_MAX_PKTLEN	9200 /* includes pkt_h and pad */
-
-#define MY_CACHELINE    (128ULL)
-#define ALIGN_CACHE     __attribute__ ((aligned (MY_CACHELINE)))
-
+#define _GNU_SOURCE     /* pthread_setaffinity_np */
+#include <sched.h>  // must be early on */
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/socket.h>
@@ -44,11 +37,97 @@
 #include <string.h>	/* memcpy */
 #include <signal.h>
 
+
+/* XXX where ? */
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
+
+#define MY_MAX_PKTLEN	10000 /* includes pkt_h and pad */
+#define Q_ALIGN	8
+/* default padding function */
+static inline uint32_t q_pad(uint32_t x)
+{
+    return (x + (Q_ALIGN - 1)) & ~(Q_ALIGN - 1);
+}
+
+
+
 #include <pthread.h>
+
+/* scheduling and setaffinity */
+#ifdef __FreeBSD__
+#include <pthread_np.h> /* pthread w/ affinity */
+#include <sys/cpuset.h> /* cpu_set */
+#define pthread_setname_np pthread_set_name_np
+#endif /* __FreeBSD__ */
+
+#ifdef linux
+#define cpuset_t        cpu_set_t
+#endif
+
+#ifdef __APPLE__
+
+#include <mach/mach.h>
+#include <pthread.h>
+
+static inline void _psn(void *foo, const char *n) { (void)foo; pthread_setname_np(n); }
+#define pthread_setname_np _psn
+
+#define cpu_set_t       uint32_t
+
+#define cpuset_t        uint64_t        // XXX
+static inline void CPU_ZERO(cpuset_t *p)
+{
+    *p = 0;
+}
+
+static inline void CPU_SET(uint32_t i, cpuset_t *p)
+{
+    *p |= 1<< (i & 0x3f);
+}
+
+static inline int CPU_ISSET(uint32_t i, cpuset_t *p)
+{
+    return (*p & (1<< (i & 0x3f)) );
+}
+
+/*
+ * simplified version, we only bind to one core or all cores
+ * if the mask contains more than 1 bit
+ */
+static inline int
+pthread_setaffinity_np(pthread_t thread, size_t cpusetsize,
+                           cpuset_t *cpu_set)
+{
+    thread_port_t mach_thread;
+    int core, lim = 8 * cpusetsize;
+
+    for (core = 0; core < lim; core++) {
+	if (CPU_ISSET(core, cpu_set)) break;
+    }
+    if (core == lim || (*cpu_set & ~(1 << core)) != 0) {
+	core = -1;
+    }
+    printf("binding to core %d 0x%lx\n", core, (u_long)*cpu_set);
+    thread_affinity_policy_data_t policy = { core+1 };
+    mach_thread = pthread_mach_thread_np(thread);
+    thread_policy_set(pthread_mach_thread_np(thread), THREAD_AFFINITY_POLICY,
+	(thread_policy_t)&policy, 1);
+    return 0;
+}
+
+#define sched_setscheduler(a, b, c)     (1) /* error */
+
+#include <libkern/OSAtomic.h>
+
+#define clock_gettime(a,b)      \
+        do {struct timespec t0 = {0,0}; *(b) = t0; } while (0)
+#endif /* APPLE */
+
+void runon(const char *,int);
 
 #include <stdlib.h>	/* strtol */
 
-_Static_assert(MY_Q_BUFLEN > 2 * MY_MAX_PKTLEN, "queue too small");
 
 #ifdef ND
 #undef ND
@@ -85,17 +164,18 @@ _Static_assert(MY_Q_BUFLEN > 2 * MY_MAX_PKTLEN, "queue too small");
     } while (0)
 #endif /* debugging macros */
 
-#define SAFE_CALLOC(_sz)					\
+/* set a 64_bit timestamp in nanoseconds */
+static inline uint64_t ts64(void)
+{
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return (t.tv_usec * 1000 + 1000000000UL*t.tv_sec);
+}
+
+#define SAFE_CALLOC(_sz)	/* unused */			\
     ({	int sz = _sz; void *p = sz>0 ? calloc(1, sz) : NULL;	\
 	if (!p) { D("alloc error %d bytes", sz); exit(1); }	\
 	 p;} )
-
-/* default padding function */
-static inline uint32_t
-q_pad(uint32_t x)
-{
-	return (x + (Q_ALIGN - 1)) & ~(Q_ALIGN - 1);
-}
 
 
 /*
@@ -122,89 +202,49 @@ h_type(const void *_h)
     return n[h->type];
 }
 
-/*
- * a queue which we can use for packets and PALs.
- * Each object in the queue is preceded by a q_pkt_hdr
- * which also includes type and length.
- * Packets+hdr are always contiguous, we leave room in the queue
- * so the last record can be a "WRAP" command go to back.
- * q_head == q_tail means empty queue. They are in separate
- * cache lines to avoid collisions, and are updated lazily;
- * producer and consumer have private copies of the pointers.
- * In particular:
- *    
- * to avoid too many cache collisions
- * 
- */
-struct pkt_q {
-    uint32_t	buflen;
-    char *	buf; /* the payload */
-    char name[80];
+struct pconn_state;
 
-    /* producer's fields */
-    uint64_t	prod_pkts ALIGN_CACHE; /* tx counter */
-    uint64_t	prod_head_update;
-    uint64_t	prod_tail_update;
-
-    uint32_t	prod_head;      /* cached copy */
-    uint32_t	prod_tail;      /* cached copy */
-
-    /* consumer's fields */
-    uint64_t	cons_pkts ALIGN_CACHE;
-    uint64_t	cons_head_update;
-    uint64_t	cons_tail_update;
-    uint64_t	cons_empty_loop;
-    uint64_t	cons_inq_empty;
-
-    uint32_t	cons_head;	/* cached copy */
-    uint32_t	cons_wr_head;	/* cached copy */
-    uint32_t	cons_tail;	/* cached copy */
-
-    /* shared fields */
-    volatile uint32_t q_tail ALIGN_CACHE; /* producer writes here */
-    volatile uint32_t q_end; /* producer writes here */
-
-    volatile uint32_t q_head ALIGN_CACHE; /* consumer reads from here */
-};
-
-struct nmstate;
-
-struct nmthread { /* per thread info */
+struct my_td { /* per thread info */
     uint32_t id;
+    char name[80];
+    uint32_t core; /* which core is used to run us */
 
-    struct nmstate *parent;
-    struct nmthread *twin; /* same side, other direction */
-    struct nmthread *peer; /* same direction, other side */
+    struct pconn_state *parent;
+    struct my_td *twin; /* same side, other direction */
+    struct my_td *peer; /* same direction, other side */
     pthread_t td_id;
 
-    void *(*handler)(void *);
-    uint32_t my_id;	/* 0.. n_threads - 1 */
-    uint32_t ready;
+    void *(*handler)(void *); /* main thread handler */
+    void *(*pr_stat)(void *); /* stat printer */
+    volatile uint32_t ready; /* 0: not ready; 1: ready; 2: complete; 3: joined */
+
+    uint32_t pkt_len;
+
+    /* private fields */
+    uint64_t datalen;
+    void *data;
 
     int listen_fd;
     int fd;
-    uint32_t tcp_buflen;	/* for tcp I/O */
-    char *tcp_buf; /* for tcp I/O */
 
-    struct pkt_q *q; /* in or out */
-
-    uint64_t pkt_count;
-    uint64_t byte_count;
+    struct pcq_t *q; /* in or out */
 };
 
-struct nmport {
+struct pconn_port {
     const char *name;
 };
 
-
-struct nmstate {
+struct pconn_state { /* global arguments and resources */
     uint32_t verbose;
     uint32_t n_chains; /* 1 or 2; threads are twice as many */
+    uint32_t qlen;	/* in slots/bytes */
+    uint32_t obj_size;
+    uint32_t mode;	/* in bytes */
+    uint32_t base_core;	/* first core to use */
 
-    const char *port_name[2]; /* always 2 */
-
-    struct pkt_q q[2];	/* same as chains, contains queue */
-    struct nmthread td[4];	/* twice as chains */
+    struct pconn_port port[2];
+    struct pcq_t *q[2];	/* same as chains, contains queue */
+    struct my_td td[4];	/* twice as chains */
 };
 
 

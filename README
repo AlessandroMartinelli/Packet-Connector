@@ -1,0 +1,16 @@
+The code should support methods such as
+
+nm_open()
+nm_inject()
+nm_dispatch()
+
+nm_open()
+	opens a file descriptor e.g. tcp, mmaps one fake tx and rx ring,
+	backing store for reads and writes (room for descriptor and packet)
+
+nm_dispatch()
+	starts with a non blocking read to extract new info into the ring
+	then behaves as the normal one
+
+nm_inject()
+	copies into a linear buffer
