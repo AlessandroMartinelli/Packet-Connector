@@ -156,6 +156,7 @@ struct pcq_t {
      * store_mask is used for normalization, one less the size.
      * capacity may be less than store_size
      */
+    // TODO: maybe store_mast "must be a power of 2 - 1;
     index_t store_mask;	/* must be a power of 2 <= half of index_t */
     index_t capacity;	/* must be <= store_size XXX right now only == */
     uint32_t obj_size;	/* size of individual objects */
@@ -366,7 +367,7 @@ static inline index_t pcq_wait_space(struct pcq_t *q, index_t want)
 }
 
 /*
- * return true if 'want' units are available, refresh prod_ci if i > 0
+ * return true if 'want' units are available, refresh cons_pi if i > 0
  */
 static inline bool cons_has_data(struct pcq_t *q, int i, index_t want)
 {
@@ -374,7 +375,7 @@ static inline bool cons_has_data(struct pcq_t *q, int i, index_t want)
     if (i != 0) {	/* refresh from exported value */
 	q->cons_pi = q->__prod_index;
     }
-    return PCQ_IW(q->cons_pi - q->cons_ci) >= want ;
+    return PCQ_IW(q->cons_pi - q->cons_ci) >= want;
 }
 
 /* update cons_index, send a notification if we cross prod_event. */
@@ -402,6 +403,10 @@ static inline void pcq_cons_advance(struct pcq_t *q, index_t have)
 	pcq_cons_notify(q);
 }
 
+// TODO: maybe want are packet, not bytes.
+/* Waits until there are at least "want" bytes to read, and return the number of
+ * bytes to read. It may also be used as non-blocking (want = 0) for discovering
+ * the number of bytes to read. */
 static inline index_t pcq_wait_data(struct pcq_t *q, index_t want)
 {
     while (true) {
@@ -440,6 +445,9 @@ static inline bool pcq_push(struct pcq_t *q, void *d)
     return true;
 }
 
+// TODO: I'm afraid 1 may be a packet, not a byte. This also since store is a void**
+/* Wait until there is at least 1 byte to read, then it return it and advance
+ * cons_ci */
 static inline void * pcq_pull(struct pcq_t *q)
 {
     void *ret;

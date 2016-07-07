@@ -2,8 +2,6 @@
 <configurationDescriptor version="97">
   <logicalFolder name="root" displayName="root" projectFiles="true" kind="ROOT">
     <df root="." name="0">
-      <df name="build">
-      </df>
       <in>pconn.c</in>
       <in>pconn.h</in>
       <in>pcq.h</in>
