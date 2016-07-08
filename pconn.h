@@ -127,6 +127,7 @@ pthread_setaffinity_np(pthread_t thread, size_t cpusetsize,
 void runon(const char *,int);
 
 #include <stdlib.h>	/* strtol */
+#include <fcntl.h>       /* file open */
 
 
 #ifdef ND

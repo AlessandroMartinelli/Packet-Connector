@@ -213,7 +213,7 @@ f_tcp_read(struct my_td *t)
     D("WWW closing fd, rd %d local %d", rd, q->prod_pi);
     close(t->fd);
     t->fd = t->twin->fd = -1; /* same side */
-    t->ready = t->twin->ready = 2;
+    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
     return NULL;
 }
 
@@ -277,7 +277,7 @@ f_tcp_write(struct my_td *t)
     D("WWW closing fd");
     close(t->fd);
     t->fd = t->twin->fd = -1;
-    t->ready = t->twin->ready = 2;
+    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
     return NULL;
 }
 
@@ -314,7 +314,7 @@ f_tcp_body(void *_f)
 	    t->listen_fd = t->fd;
 	    t->fd = -1;
 	}
-	t->ready = 1;
+	t->ready = t->twin->ready = 1;
 	if (f->n_chains == 2) {
 	    t[2].fd = t->fd;
 	    t[2].listen_fd = t->listen_fd;
@@ -331,7 +331,7 @@ f_tcp_body(void *_f)
     	for (;;) {
 	    D("III running %d in server mode on fd %d", t->id, t->listen_fd);
             printf("id=%d, twin fd is %d\n",t->id,t->twin->fd);
-	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;    //TODO: why t->twin->fd doesn't obtain the right value?
+	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;
 	    if (t->fd < 0) {
 		D("accept failed, retry");
 		sleep(1);
@@ -358,7 +358,11 @@ f_test_body(void *_f)
     struct test_t *d;
     struct pcq_t *q = t->q;
     int mode = f->mode;
-
+    int out_fd=-1, in_fd=-1;
+    int ret;
+    char fname[15];
+    index_t tmp_index;
+    
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "prod" : "cons", t->id);
     my_td_init(t);
@@ -367,13 +371,21 @@ f_test_body(void *_f)
     D("now thread %d ready", t->id);
     /* body */
 
+    if(t->id==1 || t->id==2){
+        sprintf(fname,"out_tid%d.raw", t->id);
+        out_fd = open(fname, O_WRONLY|O_CREAT,0666);
+    } else {
+        sprintf(fname,"in_tid%d.raw", t->id);
+        in_fd = open(fname, O_WRONLY|O_CREAT,0666);
+    }
 
     D("---- running in mode %d id %d store %p -------", mode, t->id, q->store);
-    while (t->ready && d->stop < 100) {
+    while (t->ready && d->stop < 20) {
 	struct q_pkt_hdr *h;
 	char *buf = (char *)(q->store);
 
 	if (t->id == 1 || t->id == 2) { /* consumer */
+            tmp_index = q->cons_ci;
 	    index_t avail, need;
 	    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->cons_ci));
 
@@ -402,6 +414,13 @@ f_test_body(void *_f)
 		need = q_pad(sizeof(*h) + h->len);
 		if (avail < need)
 		    pcq_wait_data(q, need);
+                
+                /* writes the received packet also on the file */
+                ret = write(out_fd, buf + pcq_ofs(q,tmp_index), sizeof(*h) + h->len);
+                if(ret == -1){
+                    D("File write error during test output");
+                }
+                
 		pcq_cons_advance(q, need);
 		d->bctr+= h->len;
 		break;
@@ -410,6 +429,8 @@ f_test_body(void *_f)
 	    index_t want, avail;
 	    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
 
+            tmp_index = q->prod_pi;
+            
 	    switch (mode) {
 	    case 0: /* push/pull */
 		pcq_push(q, (void *)(uintptr_t)((d->pctr & 0xff) != 0) );
@@ -423,11 +444,21 @@ f_test_body(void *_f)
 
 	    case 3: /* write a packet */
 		want = q_pad(sizeof(*h) + t->pkt_len);
+                
 		avail = pcq_wait_space(d->q, want);
 		ND("write at %p", h);
 		*h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, t->pkt_len};
-		//memset(h+1, 'z', t->pkt_len);
+                
+                /*fills the memory with z characters */
+		memset(h+1, 'z', t->pkt_len);
 		d->bctr += h->len;
+                
+                /* writes the generated packet also to the file */
+                ret = write(in_fd, buf + pcq_ofs(q,tmp_index), sizeof(*h) + h->len);
+                if(ret == -1){
+                    D("File write error during test input");
+                }
+                
 		pcq_prod_advance(q, want, (d->pctr & 0xff) != 0);
 		break;
 	    }
@@ -436,6 +467,11 @@ f_test_body(void *_f)
     }
 done:
     /* exiting */
+    if(t->id==1 || t->id==2){
+        close(out_fd);
+    } else {
+        close(in_fd);
+    }
     t->ready = 2;
     D("now thread %d exiting", t->id);
     return NULL;
