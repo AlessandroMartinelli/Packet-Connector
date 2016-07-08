@@ -318,7 +318,7 @@ f_tcp_body(void *_f)
 	if (f->n_chains == 2) {
 	    t[2].fd = t->fd;
 	    t[2].listen_fd = t->listen_fd;
-	    pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
+	    // pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
 	}
     }
 
@@ -330,7 +330,8 @@ f_tcp_body(void *_f)
     } else { /* server mode, base does accept, twin waits for fd */
     	for (;;) {
 	    D("III running %d in server mode on fd %d", t->id, t->listen_fd);
-	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;
+            printf("id=%d, twin fd is %d\n",t->id,t->twin->fd);
+	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;    //TODO: why t->twin->fd doesn't obtain the right value?
 	    if (t->fd < 0) {
 		D("accept failed, retry");
 		sleep(1);
@@ -473,7 +474,7 @@ main(int ac, char **av)
     t = f->td;
     f->n_chains = 1; /* unidirectional */
     f->qlen = 1<<18;	/* 16M */
-    f->mode = 0;
+    f->mode = 3;
     f->obj_size = 0;
     t[0].pkt_len = 1500;
 
