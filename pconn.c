@@ -213,7 +213,7 @@ f_tcp_read(struct my_td *t)
     D("WWW closing fd, rd %d local %d", rd, q->prod_pi);
     close(t->fd);
     t->fd = t->twin->fd = -1; /* same side */
-    t->ready = t->twin->ready = 2;
+    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
     return NULL;
 }
 
@@ -277,7 +277,7 @@ f_tcp_write(struct my_td *t)
     D("WWW closing fd");
     close(t->fd);
     t->fd = t->twin->fd = -1;
-    t->ready = t->twin->ready = 2;
+    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
     return NULL;
 }
 
@@ -314,7 +314,7 @@ f_tcp_body(void *_f)
 	    t->listen_fd = t->fd;
 	    t->fd = -1;
 	}
-	t->ready = 1;
+	t->ready = t->twin->ready = 1;
 	if (f->n_chains == 2) {
 	    t[2].fd = t->fd;
 	    t[2].listen_fd = t->listen_fd;
@@ -331,7 +331,7 @@ f_tcp_body(void *_f)
     	for (;;) {
 	    D("III running %d in server mode on fd %d", t->id, t->listen_fd);
             printf("id=%d, twin fd is %d\n",t->id,t->twin->fd);
-	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;    //TODO: why t->twin->fd doesn't obtain the right value?
+	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;
 	    if (t->fd < 0) {
 		D("accept failed, retry");
 		sleep(1);
