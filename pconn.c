@@ -361,6 +361,7 @@ f_test_body(void *_f)
     int out_fd=-1, in_fd=-1;
     int ret;
     char fname[15];
+    char randchar;
     index_t tmp_index;
     
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
@@ -378,9 +379,14 @@ f_test_body(void *_f)
         sprintf(fname,"in_tid%d.raw", t->id);
         in_fd = open(fname, O_WRONLY|O_CREAT,0666);
     }
+    srand(time(NULL));
 
     D("---- running in mode %d id %d store %p -------", mode, t->id, q->store);
-    while (t->ready && d->stop < 20) {
+    
+    /* test thread stops when: 
+       - if producer: after having emitted 20 stats 
+       - if consumer: never */
+    while (t->ready && (d->stop < 20 || (t->id==1 || t->id==2))) {
 	struct q_pkt_hdr *h;
 	char *buf = (char *)(q->store);
 
@@ -449,8 +455,9 @@ f_test_body(void *_f)
 		ND("write at %p", h);
 		*h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, t->pkt_len};
                 
-                /*fills the memory with z characters */
-		memset(h+1, 'z', t->pkt_len);
+                /*fills the memory with random characters */
+                randchar = rand() % 256;
+		memset(h+1, randchar, t->pkt_len);
 		d->bctr += h->len;
                 
                 /* writes the generated packet also to the file */
