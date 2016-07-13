@@ -23,15 +23,6 @@
  * SUCH DAMAGE.
  */
 
-#ifdef WITH_NETMAP
-#define NETMAP_WITH_LIBS
-#include <net/netmap_user.h>
-#endif
-
-#ifdef WITH_PCAP
-#include <pcap.h>
-#endif
-
 #include "pconn.h"
 
 #include "pcq.h"
@@ -115,7 +106,7 @@ static void
 usage(void)
 {
     D("\n\tusage: %s [-c BASE_CORE] [-l PKT_LEN] [-m MODE]\n [-q Q_LEN] [-v] [-2] port1 port2\n"
-        "\tport can be netmap:*, vale*, pcap:* or tcp:host:port\n"
+        "\tport can be netmap:*, vale*, pcap:device or tcp:host:port\n"
         "\thost and port are resolved with the resolver", g_argv[0]);
     exit(1);
 }
@@ -166,11 +157,93 @@ f_netmap_body(void *_f)
     return NULL;
 }
 
+/* Before we can provide an example of using pcap_loop(), we must examine the 
+ * format of our callback function. We cannot arbitrarily define our callback's 
+ * prototype; otherwise, pcap_loop() would not know how to use the function.
+ * So we use this format as the prototype for our callback function:
+
+	void got_packet(u_char *args, const struct pcap_pkthdr *header,
+	    const u_char *packet);
+ * Let's examine this in more detail. First, you'll notice that the function has
+ * a void return type. This is logical, because pcap_loop() wouldn't know how to
+ * handle a return value anyway. The first argument corresponds to the last
+ * argument of pcap_loop(). Whatever value is passed as the last argument to 
+ * pcap_loop() is passed to the first argument of our callback function every 
+ * time the function is called. The second argument is the pcap header, which 
+ * contains information about when the packet was sniffed, how large it is, etc.
+ * The pcap_pkthdr structure is defined in pcap.h as:
+
+	struct pcap_pkthdr {
+		struct timeval ts; // time stamp 
+		bpf_u_int32 caplen; // length of portion present /
+		bpf_u_int32 len; // length this packet (off wire) 
+	};
+
+*/
+static void *
+f_pcap_read(struct my_td *t){}
+
+static void * 
+f_pcap_write(struct my_td *t){ 
+    struct pcq_t *q = t->q; 
+    char *buf = (char *)(q->store); 
+    struct test_t *d = t->data; 
+     
+    while (t->ready == 1)  { 
+  struct q_pkt_hdr *h; 
+  index_t need, avail, cur = q->cons_ci; 
+ 
+  /* Fetch one packet from the queue. Eventually we'll get it */ 
+  avail = pcq_wait_data(q, sizeof(*h)); 
+        h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur)); 
+        need = q_pad(sizeof(*h) + h->len); 
+  if (avail < need) 
+      avail = pcq_wait_data(q, need); 
+ 
+  ND("start at ofs %x", cur); 
+  while (true) { 
+            //send the packet in the interface 
+            pcap_inject(t->pcap_fd, buf + pcq_ofs(q, cur), need); 
+             
+      // XXX optional check type 
+      cur += need; 
+      avail -= need; 
+      if (h->type == H_TY_CLOSE) { 
+    D("--- found close"); 
+    t->ready = 0; 
+    break; 
+      } 
+      /* prepare for next packet, break if not available */ 
+      h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur)); 
+      if (avail < sizeof(*h)) 
+    break; 
+      need = q_pad(sizeof(*h) + h->len); 
+             
+      if (avail < need) { 
+    D("ofs %x need %x have %x", cur, need, avail); 
+    break; 
+      } 
+  } 
+        need = cur - q->cons_ci; /* how many bytes to send */ 
+  if (need == 0) { 
+      D("should not happen, empty block ?"); 
+      continue; 
+  } 
+  d->bctr += need; 
+  d->pctr += 1;   //TODO_ST: maybe this increment must be moved into the inner while 
+  pcq_cons_advance(q, need); /* lazy notify */ 
+    } 
+    D("WWW closing pcap_fd"); 
+    pcap_close(t->pcap_fd); 
+    t->fd = t->twin->fd = -1; 
+    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */ 
+    return NULL; 
+}
+
 static void *
 f_pcap_body(void *_f){
     struct my_td *t = _f;
     struct pconn_state *f = t->parent;
-#define WITH_PCAP
 #ifndef WITH_PCAP
     (void)f;
     (void)t;
@@ -183,66 +256,50 @@ f_pcap_body(void *_f){
      * (what happens if callback is fired by pcap_loop if an instance of f_pcap_read is blocked waiting for available space on the queue?)
     4) if consumer, use pcap_inject (inside f_pcap_write) to read from the queue and writing on pcap device.
     */
-    
+    struct my_td *t = _f;
+    char errbuf[PCAP_ERRBUF_SIZE];
+    struct pconn_state *f = t->parent;
+
+    snprintf(t->name, sizeof(t->name) - 1, "%s%d",
+	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
+    my_td_init(t);
+
+    if (t->q->capacity < 8 * MY_MAX_PKTLEN) {
+	D("TERMINATE, queue too short, need at least %d bytes", 8 * MY_MAX_PKTLEN);
+	t->ready = t->peer->ready = 2;
+	return NULL;
+    }
+    D("start thread %d", t->id);
+    /* complete initialization */
+
+    if (t->id < 2) { /* first and second open the tcp connection */
+        t->listen_fd = -1;
+	t->pcap_fd = pcap_open_live(f->port[t->id].name + 5, BUFSIZ, 1, 1000, errbuf);
+        if (t->pcap_fd == NULL) {
+            D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
+            return NULL;
+        }
+	t->ready = t->twin->ready = 1;
+	if (f->n_chains == 2) {
+	    t->twin.pcap_fd = t->pcap_fd;
+	}
+    }
+
+    td_wait_ready(t->parent); /* wait for client threads to be ready */
+    if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
+	D("-- running %d in producer mode", t->id);
+        pcap_loop(t->pcap_fd, -1, f_pcap_read, (u_char*) t);
+	t->ready = t->twin->ready = 2;
+    } else { /* consumer writes packets into device */
+        f_pcap_write(t);
+    }
+    if (t->id < 2 && f->n_chains == 2) {
+        pthread_join(t->twin.td_id, NULL);
+    }
+    return NULL;
 #endif
 }
 
-static void *
-f_pcap_write(struct my_td *t){
-    struct pcq_t *q = t->q;
-    char *buf = (char *)(q->store);
-    struct test_t *d = t->data;
-    
-    while (t->ready == 1)  {
-	struct q_pkt_hdr *h;
-	index_t need, avail, cur = q->cons_ci;
-
-	/* Fetch one packet from the queue. Eventually we'll get it */
-	avail = pcq_wait_data(q, sizeof(*h));
-        h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur));
-        need = q_pad(sizeof(*h) + h->len);
-	if (avail < need)
-	    avail = pcq_wait_data(q, need);
-
-	ND("start at ofs %x", cur);
-	while (true) {
-            //send the packet in the interface
-            pcap_inject(t->pcap_fd, buf + pcq_ofs(q, cur), need);
-            
-	    // XXX optional check type
-	    cur += need;
-	    avail -= need;
-	    if (h->type == H_TY_CLOSE) {
-		D("--- found close");
-		t->ready = 0;
-		break;
-	    }
-	    /* prepare for next packet, break if not available */
-	    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur));
-	    if (avail < sizeof(*h))
-		break;
-	    need = q_pad(sizeof(*h) + h->len);
-            
-	    if (avail < need) {
-		D("ofs %x need %x have %x", cur, need, avail);
-		break;
-	    }
-	}
-        need = cur - q->cons_ci; /* how many bytes to send */
-	if (need == 0) {
-	    D("should not happen, empty block ?");
-	    continue;
-	}
-	d->bctr += need;
-	d->pctr += 1;   //TODO_ST: maybe this increment must be moved into the inner while
-	pcq_cons_advance(q, need); /* lazy notify */
-    }
-    D("WWW closing pcap_fd");
-    pcap_close(t->pcap_fd);
-    t->fd = t->twin->fd = -1;
-    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
-    return NULL;
-}
 
 /* read from socket into the queue */
 static void *
@@ -397,8 +454,8 @@ f_tcp_body(void *_f)
 	}
 	t->ready = t->twin->ready = 1;
 	if (f->n_chains == 2) {
-	    t[2].fd = t->fd;
-	    t[2].listen_fd = t->listen_fd;
+	    t->twin.fd = t->fd;
+	    t->twin.listen_fd = t->listen_fd;
 	    // pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
 	}
     }
@@ -407,11 +464,11 @@ f_tcp_body(void *_f)
     if (t->listen_fd == -1) { /* client mode, connect and done */
 	D("-- running %d in client mode", t->id);
 	cb(t);
-	t->ready = t->twin->ready = 2;
+	t->ready = t->twin->ready = 2; /* TODO_ST: already done in f_tcp_read/write */
     } else { /* server mode, base does accept, twin waits for fd */
     	for (;;) {
 	    D("III running %d in server mode on fd %d", t->id, t->listen_fd);
-            printf("id=%d, twin fd is %d\n",t->id,t->twin->fd);
+            //printf("id=%d, twin fd is %d\n",t->id,t->twin->fd);
 	    t->fd = t->id < 2 ? accept(t->listen_fd, NULL, 0) : t->twin->fd;
 	    if (t->fd < 0) {
 		D("accept failed, retry");
@@ -426,7 +483,7 @@ f_tcp_body(void *_f)
 	}
     }
     if (t->id < 2 && f->n_chains == 2) {
-        pthread_join(t[2].td_id, NULL);
+        pthread_join(t->twin.td_id, NULL);
     }
     return NULL;
 }

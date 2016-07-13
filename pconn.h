@@ -37,6 +37,14 @@
 #include <string.h>	/* memcpy */
 #include <signal.h>
 
+#ifdef WITH_NETMAP
+#define NETMAP_WITH_LIBS
+#include <net/netmap_user.h>
+#endif
+
+#ifdef WITH_PCAP
+#include <pcap.h>
+#endif
 
 /* XXX where ? */
 #define likely(x)       __builtin_expect((x),1)
@@ -226,6 +234,8 @@ struct my_td { /* per thread info */
 
     int listen_fd;
     int fd;
+    
+    pcap_t* pcap_fd;
 
     struct pcq_t *q; /* in or out */
 };
