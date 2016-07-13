@@ -28,6 +28,10 @@
 #include <net/netmap_user.h>
 #endif
 
+#ifdef WITH_PCAP
+#include <pcap.h>
+#endif
+
 #include "pconn.h"
 
 #include "pcq.h"
@@ -110,8 +114,8 @@ static char **g_argv; /* we save argv here */
 static void
 usage(void)
 {
-    D("\n\tusage: %s [-v] [-2] port1 port2\n"
-        "\tports can be netmap:*, vale* or tcp:host:port\n"
+    D("\n\tusage: %s [-c BASE_CORE] [-l PKT_LEN] [-m MODE]\n [-q Q_LEN] [-v] [-2] port1 port2\n"
+        "\tport can be netmap:*, vale*, pcap:* or tcp:host:port\n"
         "\thost and port are resolved with the resolver", g_argv[0]);
     exit(1);
 }
@@ -160,6 +164,27 @@ f_netmap_body(void *_f)
     D("thread %p terminating", t);
 #endif
     return NULL;
+}
+
+static void *
+f_pcap_body(void *_f){
+    struct my_td *t = _f;
+    struct pconn_state *f = t->parent;
+#define WITH_PCAP
+#ifndef WITH_PCAP
+    (void)f;
+    (void)t;
+    D("pcap unsupported");
+#else
+    /* TODO: 
+    1) open pcap descriptor
+    2) if in bidirectional mode, pass the descriptor to the twins
+    3) if producer, use pcap_loop with callback f_pcap_read
+     * (what happens if callback is fired by pcap_loop if an instance of f_pcap_read is blocked waiting for available space on the queue?)
+    4) if consumer, use pcap_inject (inside f_pcap_write) to read from the queue and writing on pcap device.
+    */
+    
+#endif
 }
 
 
@@ -451,6 +476,7 @@ struct _sp h[] = {
 	{"netmap:", f_netmap_body},
 	{"vale", f_netmap_body},
 	{"tcp:", f_tcp_body},
+        {"pcap:", f_pcap_body},
 	{ NULL, NULL }
 };
 
