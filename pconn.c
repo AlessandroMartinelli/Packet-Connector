@@ -187,6 +187,62 @@ f_pcap_body(void *_f){
 #endif
 }
 
+static void *
+f_pcap_write(struct my_td *t){
+    struct pcq_t *q = t->q;
+    char *buf = (char *)(q->store);
+    struct test_t *d = t->data;
+    
+    while (t->ready == 1)  {
+	struct q_pkt_hdr *h;
+	index_t need, avail, cur = q->cons_ci;
+
+	/* Fetch one packet from the queue. Eventually we'll get it */
+	avail = pcq_wait_data(q, sizeof(*h));
+        h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur));
+        need = q_pad(sizeof(*h) + h->len);
+	if (avail < need)
+	    avail = pcq_wait_data(q, need);
+
+	ND("start at ofs %x", cur);
+	while (true) {
+            //send the packet in the interface
+            pcap_inject(t->pcap_fd, buf + pcq_ofs(q, cur), need);
+            
+	    // XXX optional check type
+	    cur += need;
+	    avail -= need;
+	    if (h->type == H_TY_CLOSE) {
+		D("--- found close");
+		t->ready = 0;
+		break;
+	    }
+	    /* prepare for next packet, break if not available */
+	    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur));
+	    if (avail < sizeof(*h))
+		break;
+	    need = q_pad(sizeof(*h) + h->len);
+            
+	    if (avail < need) {
+		D("ofs %x need %x have %x", cur, need, avail);
+		break;
+	    }
+	}
+        need = cur - q->cons_ci; /* how many bytes to send */
+	if (need == 0) {
+	    D("should not happen, empty block ?");
+	    continue;
+	}
+	d->bctr += need;
+	d->pctr += 1;   //TODO_ST: maybe this increment must be moved into the inner while
+	pcq_cons_advance(q, need); /* lazy notify */
+    }
+    D("WWW closing pcap_fd");
+    pcap_close(t->pcap_fd);
+    t->fd = t->twin->fd = -1;
+    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
+    return NULL;
+}
 
 /* read from socket into the queue */
 static void *
