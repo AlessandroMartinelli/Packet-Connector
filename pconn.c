@@ -180,70 +180,68 @@ f_netmap_body(void *_f)
 	};
 
 */
-static void *
-f_pcap_read(struct my_td *t){}
+void f_pcap_read(u_char *args, const struct pcap_pkthdr *header,
+	    const u_char *packet){}
 
-static void * 
-f_pcap_write(struct my_td *t){ 
-    struct pcq_t *q = t->q; 
-    char *buf = (char *)(q->store); 
-    struct test_t *d = t->data; 
-     
-    while (t->ready == 1)  { 
-  struct q_pkt_hdr *h; 
-  index_t need, avail, cur = q->cons_ci; 
- 
-  /* Fetch one packet from the queue. Eventually we'll get it */ 
-  avail = pcq_wait_data(q, sizeof(*h)); 
-        h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur)); 
-        need = q_pad(sizeof(*h) + h->len); 
-  if (avail < need) 
-      avail = pcq_wait_data(q, need); 
- 
-  ND("start at ofs %x", cur); 
-  while (true) { 
+static void *
+f_pcap_write(struct my_td *t) {
+    struct pcq_t *q = t->q;
+    char *buf = (char *) (q->store);
+    struct test_t *d = t->data;
+
+    while (t->ready == 1) {
+        struct q_pkt_hdr *h;
+        index_t need, avail, cur = q->cons_ci;
+
+        /* Fetch one packet from the queue. Eventually we'll get it */
+        avail = pcq_wait_data(q, sizeof (*h));
+        h = (struct q_pkt_hdr *) (buf + pcq_ofs(q, cur));
+        need = q_pad(sizeof (*h) + h->len);
+        if (avail < need)
+            avail = pcq_wait_data(q, need);
+
+        ND("start at ofs %x", cur);
+        while (true) {
             //send the packet in the interface 
-            pcap_inject(t->pcap_fd, buf + pcq_ofs(q, cur), need); 
-             
-      // XXX optional check type 
-      cur += need; 
-      avail -= need; 
-      if (h->type == H_TY_CLOSE) { 
-    D("--- found close"); 
-    t->ready = 0; 
-    break; 
-      } 
-      /* prepare for next packet, break if not available */ 
-      h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, cur)); 
-      if (avail < sizeof(*h)) 
-    break; 
-      need = q_pad(sizeof(*h) + h->len); 
-             
-      if (avail < need) { 
-    D("ofs %x need %x have %x", cur, need, avail); 
-    break; 
-      } 
-  } 
-        need = cur - q->cons_ci; /* how many bytes to send */ 
-  if (need == 0) { 
-      D("should not happen, empty block ?"); 
-      continue; 
-  } 
-  d->bctr += need; 
-  d->pctr += 1;   //TODO_ST: maybe this increment must be moved into the inner while 
-  pcq_cons_advance(q, need); /* lazy notify */ 
-    } 
-    D("WWW closing pcap_fd"); 
-    pcap_close(t->pcap_fd); 
-    t->fd = t->twin->fd = -1; 
-    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */ 
-    return NULL; 
+            pcap_inject(t->pcap_fd, buf + pcq_ofs(q, cur), need);
+
+            // XXX optional check type 
+            cur += need;
+            avail -= need;
+            if (h->type == H_TY_CLOSE) {
+                D("--- found close");
+                t->ready = 0;
+                break;
+            }
+            /* prepare for next packet, break if not available */
+            h = (struct q_pkt_hdr *) (buf + pcq_ofs(q, cur));
+            if (avail < sizeof (*h))
+                break;
+            need = q_pad(sizeof (*h) + h->len);
+
+            if (avail < need) {
+                D("ofs %x need %x have %x", cur, need, avail);
+                break;
+            }
+        }
+        need = cur - q->cons_ci; /* how many bytes to send */
+        if (need == 0) {
+            D("should not happen, empty block ?");
+            continue;
+        }
+        d->bctr += need;
+        d->pctr += 1; //TODO_ST: maybe this increment must be moved into the inner while 
+        pcq_cons_advance(q, need); /* lazy notify */
+    }
+    D("WWW closing pcap_fd");
+    pcap_close(t->pcap_fd);
+    t->fd = t->twin->fd = -1;
+    t->ready = t->twin->ready = 2; /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
+    return NULL;
 }
 
 static void *
 f_pcap_body(void *_f){
-    struct my_td *t = _f;
-    struct pconn_state *f = t->parent;
 #ifndef WITH_PCAP
     (void)f;
     (void)t;
@@ -281,7 +279,7 @@ f_pcap_body(void *_f){
         }
 	t->ready = t->twin->ready = 1;
 	if (f->n_chains == 2) {
-	    t->twin.pcap_fd = t->pcap_fd;
+	    t->twin->pcap_fd = t->pcap_fd;
 	}
     }
 
@@ -294,7 +292,7 @@ f_pcap_body(void *_f){
         f_pcap_write(t);
     }
     if (t->id < 2 && f->n_chains == 2) {
-        pthread_join(t->twin.td_id, NULL);
+        pthread_join(t->twin->td_id, NULL);
     }
     return NULL;
 #endif
@@ -454,8 +452,8 @@ f_tcp_body(void *_f)
 	}
 	t->ready = t->twin->ready = 1;
 	if (f->n_chains == 2) {
-	    t->twin.fd = t->fd;
-	    t->twin.listen_fd = t->listen_fd;
+	    t->twin->fd = t->fd;
+	    t->twin->listen_fd = t->listen_fd;
 	    // pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
 	}
     }
@@ -483,7 +481,7 @@ f_tcp_body(void *_f)
 	}
     }
     if (t->id < 2 && f->n_chains == 2) {
-        pthread_join(t->twin.td_id, NULL);
+        pthread_join(t->twin->td_id, NULL);
     }
     return NULL;
 }

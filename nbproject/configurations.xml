@@ -41,6 +41,7 @@
             </incDir>
             <preprocessorList>
               <Elem>DO_STAT</Elem>
+              <Elem>WITH_PCAP</Elem>
             </preprocessorList>
           </cTool>
         </makeTool>

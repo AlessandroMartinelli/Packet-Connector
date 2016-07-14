@@ -4,8 +4,8 @@ CFLAGS = -O3 -pipe -I ../../sys
 #CFLAGS += -Werror 
 CFLAGS += -Wall -Wunused-function
 CFLAGS += -Wextra
-CFLAGS += -DDO_STAT
-LDLIBS += -lpthread
+CFLAGS += -DDO_STAT -DWITH_PCAP
+LDLIBS += -lpthread -lpcap
 ifeq ($(shell uname),Linux)
         LDLIBS += -lrt  # on linux
 endif
