@@ -112,9 +112,10 @@ static char **g_argv; /* we save argv here */
 static void
 usage(void)
 {
-    D("\n\tusage: %s [-c BASE_CORE] [-l PKT_LEN] [-m MODE]\n [-q Q_LEN] [-v] [-2] port1 port2\n"
-        "\tport can be netmap:*, vale*, pcap:device or tcp:host:port\n"
-        "\thost and port are resolved with the resolver", g_argv[0]);
+    D("\n\n\tUSAGE: %s [-c BASE_CORE] [-l PKT_LEN] [-m MODE] [-q Q_LEN] [-v] [-2]"
+            " port1 port2\n"
+        "\t * port can be netmap:*, vale*, pcap:device or tcp:host:port\n"
+        "\t * host and port are resolved with the resolver", g_argv[0]);
     exit(1);
 }
 
@@ -126,12 +127,12 @@ td_wait_ready(struct pconn_state *f)
 
     /* wait for first two threads to be ready */
     for (i = 0; i < f->n_chains; ) {
-	if (!f->td[i].ready) {
+	if (!f->td[i].ready) { /* TODO_ST: if(f->t[i].state == NOT_READY)*/
 	    D("thread %d not ready, wait...", i);
 	    usleep(1000);
-	    continue;
+	    continue; /* loop without i++ */
 	}
-	i++;
+        i++;
     }
     D("+++ main threads ready");
 }
@@ -187,9 +188,13 @@ f_netmap_body(void *_f)
 	};
 
 */
+/* Callback to read from an interface with pcap
+ */
 void f_pcap_read(u_char *args, const struct pcap_pkthdr *header,
 	    const u_char *packet){}
 
+/* Callback to write into an interface with pcap
+ */
 static void *
 f_pcap_write(struct my_td *t) {
     struct pcq_t *q = t->q;
@@ -245,10 +250,19 @@ f_pcap_write(struct my_td *t) {
     D("WWW closing pcap_fd");
     pcap_close(t->pcap_fd);
     t->fd = t->twin->fd = -1;
-    t->ready = t->twin->ready = 2; /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
     return NULL;
 }
 
+/* Behaviour of pcap threads
+ * 1) Open pcap descriptor
+ * 2) If in bidirectional mode, pass the descriptor to the twins
+ * 3) If producer, use pcap_loop with callback f_pcap_read
+ *    TODO_ST: what happens if callback is fired by pcap_loop if an instance of 
+ *    f_pcap_read is blocked waiting for available space on the queue?
+ * 4) If consumer, use pcap_inject (inside f_pcap_write) to read from the queue
+ *    and writing on pcap device.
+ *    If producer, use pcap_loop to iteratively push packets into the queue.
+ */
 static void *
 f_pcap_body(void *_f){
 #ifndef WITH_PCAP
@@ -256,13 +270,6 @@ f_pcap_body(void *_f){
     (void)t;
     D("pcap unsupported");
 #else
-    /* TODO: 
-    1) open pcap descriptor
-    2) if in bidirectional mode, pass the descriptor to the twins
-    3) if producer, use pcap_loop with callback f_pcap_read
-     * (what happens if callback is fired by pcap_loop if an instance of f_pcap_read is blocked waiting for available space on the queue?)
-    4) if consumer, use pcap_inject (inside f_pcap_write) to read from the queue and writing on pcap device.
-    */
     struct my_td *t = _f;
     char errbuf[PCAP_ERRBUF_SIZE];
     struct pconn_state *f = t->parent;
@@ -286,9 +293,10 @@ f_pcap_body(void *_f){
             D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
             return NULL;
         }
-	t->ready = t->twin->ready = 1;
+	t->ready = 1;
 	if (f->n_chains == 2) {
 	    t->twin->pcap_fd = t->pcap_fd;
+            t->twin->ready = 1;
 	}
     }
 
@@ -296,10 +304,10 @@ f_pcap_body(void *_f){
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
 	D("-- running %d in producer mode", t->id);
         pcap_loop(t->pcap_fd, -1, f_pcap_read, (u_char*) t);
-	t->ready = t->twin->ready = 2;
     } else { /* consumer writes packets into device */
         f_pcap_write(t);
     }
+    t->ready = t->twin->ready = 2;
     if (t->id < 2 && f->n_chains == 2) {
         pthread_join(t->twin->td_id, NULL);
     }
@@ -358,7 +366,6 @@ f_tcp_read(struct my_td *t)
     D("WWW closing fd, rd %d local %d", rd, q->prod_pi);
     close(t->fd);
     t->fd = t->twin->fd = -1; /* same side */
-    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
     return NULL;
 }
 
@@ -422,11 +429,14 @@ f_tcp_write(struct my_td *t)
     D("WWW closing fd");
     close(t->fd);
     t->fd = t->twin->fd = -1;
-    t->ready = t->twin->ready = 2;  /* TODO_ST: maybe in server mode the state should be set to 0 ?  */
     return NULL;
 }
 
-
+/* Behaviour of tcp threads
+ * 1) Only first 2 threads open a socket (shared with twin in bidirectional mode)
+ * 2) Distinguish among server/client connection:
+ *    - 
+ */
 static void *
 f_tcp_body(void *_f)
 {
@@ -449,7 +459,7 @@ f_tcp_body(void *_f)
     if (t->id < 2) { /* first and second open the tcp connection */
         int client = 1;
 	t->listen_fd = -1;
-	t->fd = do_socket(f->port[t->id].name + 4, 0, &client); // client. Names start with tcp:
+	t->fd = do_socket(f->port[t->id].name + 4, 0, &client); // client Names start with tcp:
 	if (t->fd < 0) {
 	    D("*** cannot to %s", f->port[t->id].name);
 	    return NULL;
@@ -459,11 +469,12 @@ f_tcp_body(void *_f)
 	    t->listen_fd = t->fd;
 	    t->fd = -1;
 	}
-	t->ready = t->twin->ready = 1;
+	t->ready = 1;
 	if (f->n_chains == 2) {
 	    t->twin->fd = t->fd;
 	    t->twin->listen_fd = t->listen_fd;
 	    // pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
+            t->twin->ready = 1;
 	}
     }
 
@@ -471,7 +482,7 @@ f_tcp_body(void *_f)
     if (t->listen_fd == -1) { /* client mode, connect and done */
 	D("-- running %d in client mode", t->id);
 	cb(t);
-	t->ready = t->twin->ready = 2; /* TODO_ST: already done in f_tcp_read/write */
+	t->ready = t->twin->ready = 2;
     } else { /* server mode, base does accept, twin waits for fd */
     	for (;;) {
 	    D("III running %d in server mode on fd %d", t->id, t->listen_fd);
@@ -484,7 +495,7 @@ f_tcp_body(void *_f)
 		D("accept for %d successful, start", t->id);
 		t->ready = t->twin->ready = 1;
 		cb(t);
-		t->ready = 0;
+		t->ready = t->twin->ready = 0;
 	    }
 	    D("III closing %d in server mode", t->id);
 	}
@@ -784,13 +795,18 @@ main(int ac, char **av)
 	int waiting = 0;
 	usleep(1000000);
 	for (i = 0; i < 2*f->n_chains; i++) {
-	    if (t[i].ready == 1) t[i].pr_stat(&t[i]);
-	    if (t[i].ready == 2) {
+            /* TODO_ST: switc(t[i].ready){} */
+	    if (t[i].ready == 1) { /* ready */
+                t[i].pr_stat(&t[i]);
+            }
+	    if (t[i].ready == 2) { /* complete */
 		D("JOIN thread %d, %s", i, t[i].name);
 		pthread_join(t[i].td_id, NULL);
                 t[i].ready = 3;
             }
-	    if (t[i].ready != 3) waiting++;
+	    if (t[i].ready != 3) { /* not ready */
+                waiting++;
+            }
 	}
 	if (waiting == 0) break;
     }

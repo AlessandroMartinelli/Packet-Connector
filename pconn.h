@@ -232,6 +232,7 @@ struct my_td { /* per thread info */
     void *(*handler)(void *); /* main thread handler */
     void *(*pr_stat)(void *); /* stat printer */
     volatile uint32_t ready; /* 0: not ready; 1: ready; 2: complete; 3: joined */
+    /* TODO_ST: enum { NOT_READY, READY, COMPLETE, JOINED }; */
 
     uint32_t pkt_len;
 
