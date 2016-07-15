@@ -192,9 +192,33 @@ f_netmap_body(void *_f)
  */
 void f_pcap_read(u_char *args, const struct pcap_pkthdr *header,
 	    const u_char *packet){}
+    struct my_td *t = (struct my_td*) arg;
+    struct pcq_t *q = t->q;
+    if(t->ready != 1){
+        pcap_breakloop(t->pcap_fd);
+        
+        D("WWW closing fd, local %d", q->prod_pi);
+        pcap_close(t->pcap_fd);
+        t->pcap_fd = t->twin->pcap_fd = NULL; /* same side */
+    }
 
-/* Callback to write into an interface with pcap
- */
+    char *buf = (char *)(q->store);
+    struct test_t *d = t->data;   
+    int avail;  //TODO_ST: is it useful? not used at the moment.
+    struct q_pkt_hdr *h; /* h points to a descriptor at buf + prod_pi */
+    
+    D("header len: %d, header caplen: %d", header->len, header->caplen);    //TODO_ST: len or caplen? correct also lines 210-211
+    avail = pcq_wait_space(q, sizeof(*h) + header->caplen);
+    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
+    *h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, header->caplen};
+    memcpy(buf + pcq_ofs(q,q->prod_pi) + sizeof(*h), packet, header->caplen);
+    
+    d->bctr += sizeof(*h) + header->caplen;
+    d->pctr += 1;
+    
+    pcq_prod_advance(q, header->caplen + sizeof(*h), true);
+}
+
 static void *
 f_pcap_write(struct my_td *t) {
     struct pcq_t *q = t->q;
@@ -249,7 +273,7 @@ f_pcap_write(struct my_td *t) {
     }
     D("WWW closing pcap_fd");
     pcap_close(t->pcap_fd);
-    t->fd = t->twin->fd = -1;
+    t->pcap_fd = t->twin->pcap_fd = NULL;
     return NULL;
 }
 
@@ -302,7 +326,7 @@ f_pcap_body(void *_f){
 
     td_wait_ready(t->parent); /* wait for client threads to be ready */
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
-	D("-- running %d in producer mode", t->id);
+	D("+++ start reading from input pcap, id %d q %p ready %d", t->id, t->q, t->ready);
         pcap_loop(t->pcap_fd, -1, f_pcap_read, (u_char*) t);
     } else { /* consumer writes packets into device */
         f_pcap_write(t);
