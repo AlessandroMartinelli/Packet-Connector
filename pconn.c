@@ -69,6 +69,13 @@ my_td_init(struct my_td *t)
     t->pr_stat = f_test_stats;
 }
 
+void print_bytes(unsigned char* buf, int len){
+	int i;
+	for(i=0;i<len-1;i++)
+		printf("%02X:",buf[i]);
+	printf("%02X\n",buf[len-1]);
+}
+
 static void *
 f_test_stats(void *_f)
 {
@@ -203,7 +210,9 @@ f_pcap_write(struct my_td *t) {
         ND("start at ofs %x", cur);
         while (true) {
             //send the packet in the interface 
-            pcap_inject(t->pcap_fd, buf + pcq_ofs(q, cur), need);
+            /*D("WWW - Write to device: (%d bytes) ", h->len);
+            print_bytes((unsigned char*) (buf + sizeof(*h) + pcq_ofs(q, cur)), h->len);*/
+            pcap_inject(t->pcap_fd, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);
 
             // XXX optional check type 
             cur += need;
@@ -486,6 +495,84 @@ f_tcp_body(void *_f)
     return NULL;
 }
 
+void generate_arp_frame(char** frame, int* len){
+    
+    const char* target_ip_string="1.2.3.4";
+    const char* if_name="veth0";
+    // Construct Ethernet header (except for source MAC address).
+    // (Destination set to broadcast address, FF:FF:FF:FF:FF:FF.)
+    struct ether_header header;
+    header.ether_type=htons(ETH_P_ARP);
+    memset(header.ether_dhost,0xff,sizeof(header.ether_dhost));
+
+    // Construct ARP request (except for MAC and IP addresses).
+    struct ether_arp req;
+    req.arp_hrd=htons(ARPHRD_ETHER);
+    req.arp_pro=htons(ETH_P_IP);
+    req.arp_hln=ETHER_ADDR_LEN;
+    req.arp_pln=sizeof(in_addr_t);
+    req.arp_op=htons(ARPOP_REQUEST);
+    memset(&req.arp_tha,0,sizeof(req.arp_tha));
+
+    // Convert target IP address from string, copy into ARP request.
+    struct in_addr target_ip_addr={0};
+    if (!inet_aton(target_ip_string,&target_ip_addr)) {
+       fprintf(stderr,"%s is not a valid IP address",target_ip_string);
+       exit(1);
+    }
+    memcpy(&req.arp_tpa,&target_ip_addr.s_addr,sizeof(req.arp_tpa));
+
+    // Write the interface name to an ifreq structure,
+    // for obtaining the source MAC and IP addresses.
+    struct ifreq ifr;
+    size_t if_name_len=strlen(if_name);
+    if (if_name_len<sizeof(ifr.ifr_name)) {
+        memcpy(ifr.ifr_name,if_name,if_name_len);
+        ifr.ifr_name[if_name_len]=0;
+    } else {
+        fprintf(stderr,"interface name is too long");
+        exit(1);
+    }
+
+    // Open an IPv4-family socket for use when calling ioctl.
+    int fd=socket(AF_INET,SOCK_DGRAM,0);
+    if (fd==-1) {
+        perror(0);
+        exit(1);
+    }
+
+    // Obtain the source IP address, copy into ARP request
+    if (ioctl(fd,SIOCGIFADDR,&ifr)==-1) {
+        perror(0);
+        close(fd);
+        exit(1);
+    }
+    struct sockaddr_in* source_ip_addr = (struct sockaddr_in*)&ifr.ifr_addr;
+    memcpy(&req.arp_spa,&source_ip_addr->sin_addr.s_addr,sizeof(req.arp_spa));
+
+    // Obtain the source MAC address, copy into Ethernet header and ARP request.
+    if (ioctl(fd,SIOCGIFHWADDR,&ifr)==-1) {
+        perror(0);
+        close(fd);
+        exit(1);
+    }
+    if (ifr.ifr_hwaddr.sa_family!=ARPHRD_ETHER) {
+        fprintf(stderr,"not an Ethernet interface");
+        close(fd);
+        exit(1);
+    }
+    const unsigned char* source_mac_addr=(unsigned char*)ifr.ifr_hwaddr.sa_data;
+    memcpy(header.ether_shost,source_mac_addr,sizeof(header.ether_shost));
+    memcpy(&req.arp_sha,source_mac_addr,sizeof(req.arp_sha));
+    close(fd);
+
+    // Combine the Ethernet header and ARP request into a contiguous block.
+    *len = sizeof(struct ether_header)+sizeof(struct ether_arp);
+    *frame = (char*)calloc(*len, sizeof(char));
+    memcpy(*frame,&header,sizeof(struct ether_header));
+    memcpy(*frame+sizeof(struct ether_header),&req,sizeof(struct ether_arp));
+}
+
 static void *
 f_test_body(void *_f)
 {
@@ -494,6 +581,8 @@ f_test_body(void *_f)
     struct test_t *d;
     struct pcq_t *q = t->q;
     int mode = f->mode;
+    char* arp_frame;
+    int arp_len;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "prod" : "cons", t->id);
@@ -502,7 +591,10 @@ f_test_body(void *_f)
     t->ready = 1;
     D("now thread %d ready", t->id);
     /* body */
-
+    
+    generate_arp_frame(&arp_frame, &arp_len);
+    t->pkt_len = arp_len;
+    D("arp frame len = %d",arp_len);
 
     D("---- running in mode %d id %d store %p -------", mode, t->id, q->store);
     while (t->ready && d->stop < 100) {
@@ -562,6 +654,10 @@ f_test_body(void *_f)
 		avail = pcq_wait_space(d->q, want);
 		ND("write at %p", h);
 		*h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, t->pkt_len};
+                
+                memcpy(h+1,arp_frame,t->pkt_len);
+                /*D("RRR - write data to queue (%d bytes): ",t->pkt_len);
+                print_bytes((unsigned char*)(h+1),t->pkt_len);*/
 		//memset(h+1, 'z', t->pkt_len);
 		d->bctr += h->len;
 		pcq_prod_advance(q, want, (d->pctr & 0xff) != 0);

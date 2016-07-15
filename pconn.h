@@ -37,6 +37,13 @@
 #include <string.h>	/* memcpy */
 #include <signal.h>
 
+/*arp packet generation headers*/
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <net/ethernet.h>
+#include <netinet/if_ether.h>
+#include <sys/ioctl.h>
+
 #ifdef WITH_NETMAP
 #define NETMAP_WITH_LIBS
 #include <net/netmap_user.h>
