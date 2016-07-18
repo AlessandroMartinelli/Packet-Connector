@@ -85,10 +85,11 @@ f_test_stats(void *_f)
     double dt = (now - d->ts)/1e9;
 
 #define X(v) (u_long)(d->q->v - d->dumpq.v)
-    D("T%d %.3f s %.3e tps %.3e Bps %lu %lu %lu %lu %lu - %lu %lu %lu %lu %lu %lu",
+    D("T%d %.3f s %.3e tps %.3e Bps pctr: %llu; %lu %lu %lu %lu %lu - %lu %lu %lu %lu %lu %lu",
 		t->id,
 		dt, (double)(d->pctr - d->pctr_old)/dt,
 		(double)(d->bctr - d->bctr_old)/dt,
+                d->pctr,
 		X(prod_space_stat[0]), X(prod_space_stat[1]), X(prod_space_stat[2]),
 		X(prod_space_stat[3]), X(prod_space_stat[4]),
 		X(cons_data_stat[0]), X(cons_data_stat[1]), X(cons_data_stat[2]),
@@ -190,10 +191,11 @@ f_netmap_body(void *_f)
 */
 /* Callback to read from an interface with pcap
  */
-void f_pcap_read(u_char *args, const struct pcap_pkthdr *header,
-	    const u_char *packet){}
+void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
+	    const u_char *packet){
     struct my_td *t = (struct my_td*) arg;
     struct pcq_t *q = t->q;
+    int need;
     if(t->ready != 1){
         pcap_breakloop(t->pcap_fd);
         
@@ -207,16 +209,22 @@ void f_pcap_read(u_char *args, const struct pcap_pkthdr *header,
     int avail;  //TODO_ST: is it useful? not used at the moment.
     struct q_pkt_hdr *h; /* h points to a descriptor at buf + prod_pi */
     
-    D("header len: %d, header caplen: %d", header->len, header->caplen);    //TODO_ST: len or caplen? correct also lines 210-211
-    avail = pcq_wait_space(q, sizeof(*h) + header->caplen);
+    /*D("header len: %d, header caplen: %d; prod_pi: %d; public_prod_pi; %d", header->len, 
+            header->caplen, q->prod_pi, q->__prod_index);*/    //TODO_ST: len or caplen? correct also lines 210-211
+    
+    need = q_pad(sizeof(*h) + header->caplen);
+    avail = pcq_wait_space(q, need);
     h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
     *h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, header->caplen};
-    memcpy(buf + pcq_ofs(q,q->prod_pi) + sizeof(*h), packet, header->caplen);
+    memcpy(h+1, packet, header->caplen);
     
-    d->bctr += sizeof(*h) + header->caplen;
+    /*printf("\n---------------\n (producer, seq#: %d, padding size: %d %d)",d->pctr, need, sizeof(*h) + header->caplen);
+    print_bytes((unsigned char*)(buf + pcq_ofs(q, q->prod_pi)), header->caplen + sizeof(*h));*/
+    
+    d->bctr += need;
     d->pctr += 1;
     
-    pcq_prod_advance(q, header->caplen + sizeof(*h), true);
+    pcq_prod_advance(q, need, true);
 }
 
 static void *
@@ -241,7 +249,8 @@ f_pcap_write(struct my_td *t) {
             //send the packet in the interface 
             /*D("WWW - Write to device: (%d bytes) ", h->len);
             print_bytes((unsigned char*) (buf + sizeof(*h) + pcq_ofs(q, cur)), h->len);*/
-            pcap_inject(t->pcap_fd, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);
+            pcap_inject(t->pcap_fd, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);  
+            d->pctr += 1;
 
             // XXX optional check type 
             cur += need;
@@ -268,7 +277,7 @@ f_pcap_write(struct my_td *t) {
             continue;
         }
         d->bctr += need;
-        d->pctr += 1; //TODO_ST: maybe this increment must be moved into the inner while 
+        //d->pctr += 1;//TODO_ST: maybe this increment must be moved into the inner while 
         pcq_cons_advance(q, need); /* lazy notify */
     }
     D("WWW closing pcap_fd");
@@ -665,6 +674,10 @@ f_test_body(void *_f)
 		need = q_pad(sizeof(*h) + h->len);
 		if (avail < need)
 		    pcq_wait_data(q, need);
+                
+                /*printf("\n---------------\n (consumer, seq#: %d)",h->seq);
+                print_bytes((unsigned char*)h, sizeof(*h)+h->len);*/
+                
 		pcq_cons_advance(q, need);
 		d->bctr+= h->len;
 		break;
