@@ -200,7 +200,7 @@ void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
         pcap_breakloop(t->pcap_fd);
         
         D("WWW closing fd, local %d", q->prod_pi);
-        pcap_close(t->pcap_fd);
+        pcap_close(t->pcap_fd); //TODO_ST: handle critical run.. maybe semaphores?
         t->pcap_fd = t->twin->pcap_fd = NULL; /* same side */
     }
 
@@ -249,7 +249,7 @@ f_pcap_write(struct my_td *t) {
             //send the packet in the interface 
             /*D("WWW - Write to device: (%d bytes) ", h->len);
             print_bytes((unsigned char*) (buf + sizeof(*h) + pcq_ofs(q, cur)), h->len);*/
-            pcap_inject(t->pcap_fd, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);  
+            pcap_inject(t->pcap_fd, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);  //TODO_ST: usare puntatori a funzione per generalizzare
             d->pctr += 1;
 
             // XXX optional check type 
@@ -319,8 +319,8 @@ f_pcap_body(void *_f){
     D("start thread %d", t->id);
     /* complete initialization */
 
-    if (t->id < 2) { /* first and second open the tcp connection */
-        t->listen_fd = -1;
+    if (t->id < 2) { /* first and second open the pcap connection */
+        //t->listen_fd = -1;
 	t->pcap_fd = pcap_open_live(f->port[t->id].name + 5, BUFSIZ, 1, 1000, errbuf);
         if (t->pcap_fd == NULL) {
             D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
@@ -336,6 +336,10 @@ f_pcap_body(void *_f){
     td_wait_ready(t->parent); /* wait for client threads to be ready */
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
 	D("+++ start reading from input pcap, id %d q %p ready %d", t->id, t->q, t->ready);
+        /* pcap_loop(), differently from pcap_dispatch(), doesn't return when the
+         * packets timeout occurs. pcap_loop() listen forever also if no packets
+         * arrive for a long time.
+         */
         pcap_loop(t->pcap_fd, -1, f_pcap_read, (u_char*) t);
     } else { /* consumer writes packets into device */
         f_pcap_write(t);
