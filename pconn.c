@@ -189,46 +189,9 @@ f_netmap_body(void *_f)
 	};
 
 */
-/* Callback to read from an interface with pcap
- */
-void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
-	    const u_char *packet){
-    struct my_td *t = (struct my_td*) arg;
-    struct pcq_t *q = t->q;
-    int need;
-    if(t->ready != 1){
-        pcap_breakloop(t->pcap_fd);
-        
-        D("WWW closing fd, local %d", q->prod_pi);
-        pcap_close(t->pcap_fd); //TODO_ST: handle critical run.. maybe semaphores?
-        t->pcap_fd = t->twin->pcap_fd = NULL; /* same side */
-    }
 
-    char *buf = (char *)(q->store);
-    struct test_t *d = t->data;   
-    int avail;  //TODO_ST: is it useful? not used at the moment.
-    struct q_pkt_hdr *h; /* h points to a descriptor at buf + prod_pi */
-    
-    /*D("header len: %d, header caplen: %d; prod_pi: %d; public_prod_pi; %d", header->len, 
-            header->caplen, q->prod_pi, q->__prod_index);*/    //TODO_ST: len or caplen? correct also lines 210-211
-    
-    need = q_pad(sizeof(*h) + header->caplen);
-    avail = pcq_wait_space(q, need);
-    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
-    *h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, header->caplen};
-    memcpy(h+1, packet, header->caplen);
-    
-    /*printf("\n---------------\n (producer, seq#: %d, padding size: %d %d)",d->pctr, need, sizeof(*h) + header->caplen);
-    print_bytes((unsigned char*)(buf + pcq_ofs(q, q->prod_pi)), header->caplen + sizeof(*h));*/
-    
-    d->bctr += need;
-    d->pctr += 1;
-    
-    pcq_prod_advance(q, need, true);
-}
-
-/**************** callback methods for f_queue_read() ****************/
-/* NOTE: all return negative value in case of error, except finalize */
+/**************** callback methods for f_generalized_write() ****************/
+/* NOTE: all return negative value in case of error, except finalize        */
 
 int pcap_packet_inject(struct my_td *t, char* buf, int len){
     return pcap_inject(t->pcap_fd, buf, len);
@@ -268,11 +231,53 @@ void tcp_finalize(struct my_td *t){
 
 void pcap_finalize(struct my_td *t){
     D("WWW closing pcap_fd");
-    pcap_close(t->pcap_fd);
-    t->pcap_fd = t->twin->pcap_fd = NULL;
+    //threads 0 and 1 close the pcap stream
+    if(t->id == 0 || t->id == 1){
+        pcap_close(t->pcap_fd);
+    }
 }
 
-/*********************************************************************/
+/****************************************************************************/
+
+
+/* Callback to read from an interface with pcap
+ */
+void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
+	    const u_char *packet){
+    struct my_td *t = (struct my_td*) arg;
+    struct pcq_t *q = t->q;
+    int need;
+    if(t->ready != 1){
+        pcap_breakloop(t->pcap_fd);
+        
+        D("WWW closing fd, local %d", q->prod_pi);
+        /*pcap_close(t->pcap_fd); //TODO_ST: handle critical run.. maybe semaphores?
+        t->pcap_fd = t->twin->pcap_fd = NULL; //same side */
+        pcap_finalize(t);
+    }
+
+    char *buf = (char *)(q->store);
+    struct test_t *d = t->data;   
+    //int avail;  //TODO_ST: is it useful? not used at the moment.
+    struct q_pkt_hdr *h; /* h points to a descriptor at buf + prod_pi */
+    
+    /*D("header len: %d, header caplen: %d; prod_pi: %d; public_prod_pi; %d", header->len, 
+            header->caplen, q->prod_pi, q->__prod_index);*/    //TODO_ST: len or caplen? correct also lines 210-211
+    
+    need = q_pad(sizeof(*h) + header->caplen);
+    /*avail = */pcq_wait_space(q, need);
+    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
+    *h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, header->caplen};
+    memcpy(h+1, packet, header->caplen);
+    
+    /*printf("\n---------------\n (producer, seq#: %d, padding size: %d %d)",d->pctr, need, sizeof(*h) + header->caplen);
+    print_bytes((unsigned char*)(buf + pcq_ofs(q, q->prod_pi)), header->caplen + sizeof(*h));*/
+    
+    d->bctr += need;
+    d->pctr += 1;
+    
+    pcq_prod_advance(q, need, true);
+}
 
 /* This function read data from the queue and write onto a specific device
  * through the use of 3 different callbacks, that could be customized depending
@@ -391,6 +396,7 @@ f_pcap_body(void *_f){
 	t->pcap_fd = pcap_open_live(f->port[t->id].name + 5, BUFSIZ, 1, 1000, errbuf);
         if (t->pcap_fd == NULL) {
             D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
+            t->ready = t->twin->ready = 2;
             return NULL;
         }
 	t->ready = 1;
@@ -568,13 +574,16 @@ f_tcp_body(void *_f)
     
     D("start thread %d", t->id);
     /* complete initialization */
-
+    
+    t->listen_fd = -1;
+    
     if (t->id < 2) { /* first and second open the tcp connection */
         int client = 1;
-	t->listen_fd = -1;
+	
 	t->fd = do_socket(f->port[t->id].name + 4, 0, &client); // client Names start with tcp:
 	if (t->fd < 0) {
 	    D("*** cannot to %s", f->port[t->id].name);
+            t->ready = t->twin->ready = 2;
 	    return NULL;
 	}
 	D("mode for %d is %s", t->id, client ? "client" : "server");
@@ -763,7 +772,7 @@ f_test_body(void *_f)
 		break;
 	    }
 	} else { /* producer */
-	    index_t want, avail;
+	    index_t want/*, avail*/;
 	    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
 
 	    switch (mode) {
@@ -779,7 +788,7 @@ f_test_body(void *_f)
 
 	    case 3: /* write a packet */
 		want = q_pad(sizeof(*h) + t->pkt_len);
-		avail = pcq_wait_space(d->q, want);
+		/*avail = */pcq_wait_space(d->q, want);
 		ND("write at %p", h);
 		*h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, t->pkt_len};
                 
