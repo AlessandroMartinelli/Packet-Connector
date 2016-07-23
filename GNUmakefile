@@ -1,30 +1,31 @@
-PROGS += nm2tcp
+PROGS += pconn
 
 CFLAGS = -O3 -pipe -I ../../sys
-CFLAGS += -Werror -Wall -Wunused-function
+#CFLAGS += -Werror 
+CFLAGS += -Wall -Wunused-function
 CFLAGS += -Wextra
-
-LDLIBS += -lpthread
+CFLAGS += -DDO_STAT -DWITH_PCAP
+LDLIBS += -lpthread -lpcap
 ifeq ($(shell uname),Linux)
         LDLIBS += -lrt  # on linux
 endif
 
-SRCS= nm2tcp.c nm_sess.c
+SRCS= pconn.c sess.c #  pconn_tcp.c pconn_netmap.c
 OBJS= $(SRCS:%.c=%.o)
-CLEANFILES = $(PROGS) $(OBJS)
+CLEANFILES = $(PROGS) $(OBJS) 
 BUILDFLDR = build/
 
 LDFLAGS += $(LDLIBS)
 
 all: $(PROGS)
-	mv *.o $(BUILDFLDR)
-	mv $(PROGS) $(BUILDFLDR)
+	test -d $(BUILDFLDR) || mkdir $(BUILDFLDR)
+	mv -t $(BUILDFLDR) $(CLEANFILES) 
 
-nm2tcp.o: nm2tcp.h
-nm_sess.o: nm2tcp.h
+pconn.o: pconn.h pcq.h
+sess.o: pconn.h
 
-nm2tcp: nm2tcp.o nm_sess.o
+pconn: pconn.o sess.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -rf $(BUILDFLDR)*
+	-@rm -rf $(BUILDFLDR)

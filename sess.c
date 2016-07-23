@@ -28,6 +28,7 @@
  * over a TCP socket, and also run the callbacks.
  */
 
+#define _GNU_SOURCE
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -38,7 +39,7 @@
 #include <sys/errno.h>
 extern int errno;
 
-#include "nm2tcp.h"
+#include "pconn.h"
 
 #include <stdio.h>
 #include <pthread.h>
@@ -50,34 +51,75 @@ extern int errno;
 
 #define SOCK_QLEN 5     /* listen lenght for incoming connection */
 
+static void
+sigpipe_handler(int arg)
+{
+    fprintf(stderr, "caught broken pipe, signal %d\n", arg);
+}
+
+void
+runon(const char *name, int i)
+{
+    static int NUM_CPUS = 0;
+    cpuset_t cpumask;
+
+    if (NUM_CPUS == 0) {
+        NUM_CPUS = sysconf(_SC_NPROCESSORS_ONLN);
+        D("system has %d cores", NUM_CPUS);
+    }
+    CPU_ZERO(&cpumask);
+    if (i >= 0) {
+        CPU_SET(i, &cpumask);
+    } else { /* -1 means it can run on any CPU */
+        int j;
+
+        i = -1;
+        for (j = 0; j < NUM_CPUS; j++) {
+            CPU_SET(j, &cpumask);
+        }
+    }
+
+    if ((errno = pthread_setaffinity_np(pthread_self(), sizeof(cpuset_t), &cpumask)) != 0) {
+        D("Unable to set affinity for %s on %d : %s", name, i, strerror(errno));
+    }
+
+    pthread_setname_np(pthread_self(), name);
+    if (i >= 0) {
+        D("thread %s on core %d", name, i);
+    } else {
+        D("thread %s on any core in 0..%d", name, NUM_CPUS - 1);
+    }
+}
+
 uint32_t
 safe_write(int fd, const char *buf, uint32_t l)
 {
-	uint32_t i = 0;
-	int n = 0;
-	for (i = 0; i < l; i += n) {
-		n = write(fd, buf + i, l - i);
-		if (n <= 0) {
-			D("short write");
-			break;
-		}
+    uint32_t i = 0;
+    int n = 0;
+
+    for (i = 0; i < l; i += n) {
+	n = write(fd, buf + i, l - i);
+	if (n <= 0) {
+	    D("short write");
+	    break;
 	}
-	ND(1,"done, i %d l %d n %d", i, l, n);
-	return i;
+    }
+    ND(1,"done, i %d l %d n %d", i, l, n);
+    return i;
 }
 
 
 int
 is_connected(int fd)
 {
-	struct sockaddr_in sa;
-	socklen_t l = sizeof(sa);
-        return getpeername(fd, (struct sockaddr *)&sa, &l) == 0 ? 1 : 0;
+    struct sockaddr_in sa;
+    socklen_t l = sizeof(sa);
+    return getpeername(fd, (struct sockaddr *)&sa, &l) == 0 ? 1 : 0;
 }
 
 /*
- * 
- * return the listen fd or -1 on error.
+ * return the socket or -1 on error.
+ * addr is tcp:host:port , empty host means client mode
  */
 int
 do_socket(const char *_addr, int nonblock, int *client)
@@ -85,6 +127,8 @@ do_socket(const char *_addr, int nonblock, int *client)
     int _cli, fd = -1, on, ret, theport;
     struct sockaddr_in s;
     char *addr, *port;
+
+    signal(SIGPIPE, sigpipe_handler);
 
     /* fill the sockaddr struct */
     bzero(&s, sizeof(s));
@@ -104,10 +148,8 @@ do_socket(const char *_addr, int nonblock, int *client)
 	D("missing port number in %s", _addr);
 	goto error;
     }
-    port[0] = '\0'; /*trick: divide the port from the addr*/
+    port[0] = '\0';
     if (port == addr) {
-        /* if port == addr, it means that the addr contains no IP:
-         * the mode in this case is: "server" (*client=0) */
 	ND("port == addr");
 	s.sin_addr.s_addr = INADDR_ANY;
 	*client = 0;
