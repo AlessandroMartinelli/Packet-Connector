@@ -231,6 +231,12 @@ struct my_td { /* per thread info */
 
     void *(*handler)(void *); /* main thread handler */
     void *(*pr_stat)(void *); /* stat printer */
+    
+    //queue read callback functions pointers
+    int(*inject_single_packet)(struct my_td*, char*, int);
+    int(*inject_multiple_data)(struct my_td*, char*, int);
+    void(*inject_finalize)(struct my_td*);
+    
     volatile uint32_t ready; /* 0: not ready; 1: ready; 2: complete; 3: joined */
     /* TODO_ST: enum { NOT_READY, READY, COMPLETE, JOINED }; */
 

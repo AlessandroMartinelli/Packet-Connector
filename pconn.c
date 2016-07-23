@@ -115,7 +115,7 @@ usage(void)
 {
     D("\n\n\tUSAGE: %s [-c BASE_CORE] [-l PKT_LEN] [-m MODE] [-q Q_LEN] [-v] [-2]"
             " port1 port2\n"
-        "\t * port can be netmap:*, vale*, pcap:device, pcap:./file_path or tcp:host:port\n"
+        "\t * port can be netmap:*, vale*, pcap:device or tcp:host:port\n"
         "\t * host and port are resolved with the resolver", g_argv[0]);
     exit(1);
 }
@@ -227,11 +227,63 @@ void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
     pcq_prod_advance(q, need, true);
 }
 
+/**************** callback methods for f_queue_read() ****************/
+/* NOTE: all return negative value in case of error, except finalize */
+
+int pcap_packet_inject(struct my_td *t, char* buf, int len){
+    return pcap_inject(t->pcap_fd, buf, len);
+}
+
+int tcp_packet_inject(struct my_td *t, char* buf, int len){
+    (void)t;
+    (void)buf;
+    (void)len;
+    
+    return 0;
+}
+
+int pcap_data_inject(struct my_td *t, char* buf, int len){
+    (void)t;
+    (void)buf;
+    (void)len;
+    
+    return 0;
+}
+
+int tcp_data_inject(struct my_td *t, char* buf, int len){
+    int cur;
+    cur = safe_write(t->fd, buf, len);
+    if (cur != len) { // short write, circuit closed
+        RD(5, "short write want %d have %d", len, cur);
+        return -1;
+    }
+    return 0;
+}
+
+void tcp_finalize(struct my_td *t){
+    D("WWW closing fd");
+    close(t->fd);
+    t->fd = t->twin->fd = -1;
+}
+
+void pcap_finalize(struct my_td *t){
+    D("WWW closing pcap_fd");
+    pcap_close(t->pcap_fd);
+    t->pcap_fd = t->twin->pcap_fd = NULL;
+}
+
+/*********************************************************************/
+
+/* This function read data from the queue and write onto a specific device
+ * through the use of 3 different callbacks, that could be customized depending
+ * on the interface we are using.
+ */
 static void *
-f_pcap_write(struct my_td *t) {
+f_generalized_write(struct my_td *t) {
     struct pcq_t *q = t->q;
     char *buf = (char *) (q->store);
     struct test_t *d = t->data;
+    int ret;
 
     while (t->ready == 1) {
         struct q_pkt_hdr *h;
@@ -249,7 +301,11 @@ f_pcap_write(struct my_td *t) {
             //send the packet in the interface 
             /*D("WWW - Write to device: (%d bytes) ", h->len);
             print_bytes((unsigned char*) (buf + sizeof(*h) + pcq_ofs(q, cur)), h->len);*/
-            pcap_inject(t->pcap_fd, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);  //TODO_ST: usare puntatori a funzione per generalizzare
+            ret = t->inject_single_packet(t, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);
+            if(ret<0){
+                t->ready = 2;   //TODO_ST: is it right to go to state 2?
+                break;
+            }
             d->pctr += 1;
 
             // XXX optional check type 
@@ -276,13 +332,18 @@ f_pcap_write(struct my_td *t) {
             D("should not happen, empty block ?");
             continue;
         }
+        
+        ret = t->inject_multiple_data(t, buf + pcq_ofs(q, q->cons_ci), need);
+        if(ret<0){
+            break;
+        }
+        
         d->bctr += need;
         //d->pctr += 1;//TODO_ST: maybe this increment must be moved into the inner while 
         pcq_cons_advance(q, need); /* lazy notify */
     }
-    D("WWW closing pcap_fd");
-    pcap_close(t->pcap_fd);
-    t->pcap_fd = t->twin->pcap_fd = NULL;
+    
+    t->inject_finalize(t);
     return NULL;
 }
 
@@ -306,7 +367,6 @@ f_pcap_body(void *_f){
     struct my_td *t = _f;
     char errbuf[PCAP_ERRBUF_SIZE];
     struct pconn_state *f = t->parent;
-    char *device;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
@@ -317,25 +377,20 @@ f_pcap_body(void *_f){
 	t->ready = t->peer->ready = 2;
 	return NULL;
     }
+    
+    //initializes function pointers
+    t->inject_single_packet = pcap_packet_inject;
+    t->inject_multiple_data = pcap_data_inject;
+    t->inject_finalize = pcap_finalize;
+    
     D("start thread %d", t->id);
     /* complete initialization */
 
     if (t->id < 2) { /* first and second open the pcap connection */
-        t->listen_fd = -1;
-        device = f->port[t->id].name + 5; /* move beyond "pcap:" */
-	
-        t->pcap_fd = (*(device) == '.') ?
-            /* e.g. pcap:./filename.ext */
-            pcap_open_offline(device+2, errbuf) :
-            /* e.g. pcap:eth0 */
-            pcap_open_live(device, BUFSIZ, 1, 1000, errbuf);
-        
+        //t->listen_fd = -1;
+	t->pcap_fd = pcap_open_live(f->port[t->id].name + 5, BUFSIZ, 1, 1000, errbuf);
         if (t->pcap_fd == NULL) {
             D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
-            t->ready = t->twin->ready = 2;
-            if (t->id < 2 && f->n_chains == 2) {
-                pthread_join(t->twin->td_id, NULL);
-            }
             return NULL;
         }
 	t->ready = 1;
@@ -345,7 +400,7 @@ f_pcap_body(void *_f){
 	}
     }
 
-    td_wait_ready(t->parent); /* wait for all the threads to be ready */
+    td_wait_ready(t->parent); /* wait for client threads to be ready */
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
 	D("+++ start reading from input pcap, id %d q %p ready %d", t->id, t->q, t->ready);
         /* pcap_loop(), differently from pcap_dispatch(), doesn't return when the
@@ -354,7 +409,7 @@ f_pcap_body(void *_f){
          */
         pcap_loop(t->pcap_fd, -1, f_pcap_read, (u_char*) t);
     } else { /* consumer writes packets into device */
-        f_pcap_write(t);
+        f_generalized_write(t);
     }
     t->ready = t->twin->ready = 2;
     if (t->id < 2 && f->n_chains == 2) {
@@ -422,6 +477,8 @@ f_tcp_read(struct my_td *t)
 /*
  * read from queue, push to tcp
  */
+
+#if 0
 static void *
 f_tcp_write(struct my_td *t)
 {
@@ -480,6 +537,7 @@ f_tcp_write(struct my_td *t)
     t->fd = t->twin->fd = -1;
     return NULL;
 }
+#endif
 
 /* Behaviour of tcp threads
  * 1) Only first 2 threads open a socket (shared with twin in bidirectional mode)
@@ -491,7 +549,7 @@ f_tcp_body(void *_f)
 {
     struct my_td *t = _f;
     struct pconn_state *f = t->parent;
-    void *(*cb)(struct my_td *) = (t->id == 0 || t->id == 3) ? f_tcp_read : f_tcp_write;
+    void *(*cb)(struct my_td *) = (t->id == 0 || t->id == 3) ? f_tcp_read : f_generalized_write;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
@@ -502,6 +560,12 @@ f_tcp_body(void *_f)
 	t->ready = t->peer->ready = 2;
 	return NULL;
     }
+    
+    //initializes function pointers
+    t->inject_single_packet = tcp_packet_inject;
+    t->inject_multiple_data = tcp_data_inject;
+    t->inject_finalize = tcp_finalize;
+    
     D("start thread %d", t->id);
     /* complete initialization */
 
