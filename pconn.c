@@ -115,7 +115,7 @@ usage(void)
 {
     D("\n\n\tUSAGE: %s [-c BASE_CORE] [-l PKT_LEN] [-m MODE] [-q Q_LEN] [-v] [-2]"
             " port1 port2\n"
-        "\t * port can be netmap:*, vale*, pcap:device or tcp:host:port\n"
+        "\t * port can be netmap:*, vale*, pcap:device, pcap:./file_path or tcp:host:port\n"
         "\t * host and port are resolved with the resolver", g_argv[0]);
     exit(1);
 }
@@ -306,6 +306,7 @@ f_pcap_body(void *_f){
     struct my_td *t = _f;
     char errbuf[PCAP_ERRBUF_SIZE];
     struct pconn_state *f = t->parent;
+    char *device;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
@@ -320,10 +321,21 @@ f_pcap_body(void *_f){
     /* complete initialization */
 
     if (t->id < 2) { /* first and second open the pcap connection */
-        //t->listen_fd = -1;
-	t->pcap_fd = pcap_open_live(f->port[t->id].name + 5, BUFSIZ, 1, 1000, errbuf);
+        t->listen_fd = -1;
+        device = f->port[t->id].name + 5; /* move beyond "pcap:" */
+	
+        t->pcap_fd = (*(device) == '.') ?
+            /* e.g. pcap:./filename.ext */
+            pcap_open_offline(device+2, errbuf) :
+            /* e.g. pcap:eth0 */
+            pcap_open_live(device, BUFSIZ, 1, 1000, errbuf);
+        
         if (t->pcap_fd == NULL) {
             D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
+            t->ready = t->twin->ready = 2;
+            if (t->id < 2 && f->n_chains == 2) {
+                pthread_join(t->twin->td_id, NULL);
+            }
             return NULL;
         }
 	t->ready = 1;
@@ -333,7 +345,7 @@ f_pcap_body(void *_f){
 	}
     }
 
-    td_wait_ready(t->parent); /* wait for client threads to be ready */
+    td_wait_ready(t->parent); /* wait for all the threads to be ready */
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
 	D("+++ start reading from input pcap, id %d q %p ready %d", t->id, t->q, t->ready);
         /* pcap_loop(), differently from pcap_dispatch(), doesn't return when the
