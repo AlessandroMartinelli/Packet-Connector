@@ -122,7 +122,7 @@ usage(void)
 
 
 static void
-td_wait_ready(struct pconn_state *f)
+td_wait_clients_ready(struct pconn_state *f)
 {
     uint32_t i;
 
@@ -138,6 +138,15 @@ td_wait_ready(struct pconn_state *f)
     D("+++ main threads ready");
 }
 
+static int
+td_wait_ready(struct my_td *t){
+    int tmp;
+    while(tmp = t->ready, tmp == 0){
+        usleep(1000);
+    }
+    D("my twin said me: ready=%d",tmp);
+    return tmp;
+}
 
 /*
  * The main function (id < 2) does the open,
@@ -224,13 +233,13 @@ int tcp_data_inject(struct my_td *t, char* buf, int len){
 }
 
 void tcp_finalize(struct my_td *t){
-    D("WWW closing fd");
+    D("WWW (thread %d) closing fd",t->id);
     close(t->fd);
     t->fd = t->twin->fd = -1;
 }
 
 void pcap_finalize(struct my_td *t){
-    D("WWW closing pcap_fd");
+    D("WWW (thread %d) closing pcap_fd",t->id);
     //threads 0 and 1 close the pcap stream
     if(t->id == 0 || t->id == 1){
         pcap_close(t->pcap_fd);
@@ -365,8 +374,7 @@ f_generalized_write(struct my_td *t) {
 static void *
 f_pcap_body(void *_f){
 #ifndef WITH_PCAP
-    (void)f;
-    (void)t;
+    (void)_f;
     D("pcap unsupported");
 #else
     struct my_td *t = _f;
@@ -404,9 +412,14 @@ f_pcap_body(void *_f){
 	    t->twin->pcap_fd = t->pcap_fd;
             t->twin->ready = 1;
 	}
+    } else {
+        //the twin must wait until its brother hasn't set the pcap_fd
+        if(td_wait_ready(t) == 2){
+            return NULL;
+        }
     }
 
-    td_wait_ready(t->parent); /* wait for client threads to be ready */
+    td_wait_clients_ready(t->parent); /* wait for client threads to be ready */
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
 	D("+++ start reading from input pcap, id %d q %p ready %d", t->id, t->q, t->ready);
         /* pcap_loop(), differently from pcap_dispatch(), doesn't return when the
@@ -600,7 +613,7 @@ f_tcp_body(void *_f)
 	}
     }
 
-    td_wait_ready(t->parent); /* wait for client threads to be ready */
+    td_wait_clients_ready(t->parent); /* wait for client threads to be ready */
     if (t->listen_fd == -1) { /* client mode, connect and done */
 	D("-- running %d in client mode", t->id);
 	cb(t);
@@ -629,7 +642,7 @@ f_tcp_body(void *_f)
 }
 
 void generate_arp_frame(char** frame, int* len){
-    
+    int fd = -1;
     const char* target_ip_string="1.2.3.4";
     const char* if_name="veth0";
     // Construct Ethernet header (except for source MAC address).
@@ -650,8 +663,8 @@ void generate_arp_frame(char** frame, int* len){
     // Convert target IP address from string, copy into ARP request.
     struct in_addr target_ip_addr={0};
     if (!inet_aton(target_ip_string,&target_ip_addr)) {
-       fprintf(stderr,"%s is not a valid IP address",target_ip_string);
-       exit(1);
+       D("ARP generation: %s is not a valid IP address",target_ip_string);
+       goto arp_error;
     }
     memcpy(&req.arp_tpa,&target_ip_addr.s_addr,sizeof(req.arp_tpa));
 
@@ -663,36 +676,33 @@ void generate_arp_frame(char** frame, int* len){
         memcpy(ifr.ifr_name,if_name,if_name_len);
         ifr.ifr_name[if_name_len]=0;
     } else {
-        fprintf(stderr,"interface name is too long");
-        exit(1);
+        D("ARP generation: interface name is too long");
+        goto arp_error;
     }
 
     // Open an IPv4-family socket for use when calling ioctl.
-    int fd=socket(AF_INET,SOCK_DGRAM,0);
+    fd=socket(AF_INET,SOCK_DGRAM,0);
     if (fd==-1) {
-        perror(0);
-        exit(1);
+        D("ARP generation: error opening socket");
+        goto arp_error;
     }
 
     // Obtain the source IP address, copy into ARP request
     if (ioctl(fd,SIOCGIFADDR,&ifr)==-1) {
-        perror(0);
-        close(fd);
-        exit(1);
+        D("ARP generation: error obtaining IP address");
+        goto arp_error;
     }
     struct sockaddr_in* source_ip_addr = (struct sockaddr_in*)&ifr.ifr_addr;
     memcpy(&req.arp_spa,&source_ip_addr->sin_addr.s_addr,sizeof(req.arp_spa));
 
     // Obtain the source MAC address, copy into Ethernet header and ARP request.
     if (ioctl(fd,SIOCGIFHWADDR,&ifr)==-1) {
-        perror(0);
-        close(fd);
-        exit(1);
+        D("ARP generation: error obtaining MAC address");
+        goto arp_error;
     }
     if (ifr.ifr_hwaddr.sa_family!=ARPHRD_ETHER) {
-        fprintf(stderr,"not an Ethernet interface");
-        close(fd);
-        exit(1);
+        D("ARP generation: not an Ethernet interface");
+        goto arp_error;
     }
     const unsigned char* source_mac_addr=(unsigned char*)ifr.ifr_hwaddr.sa_data;
     memcpy(header.ether_shost,source_mac_addr,sizeof(header.ether_shost));
@@ -704,6 +714,15 @@ void generate_arp_frame(char** frame, int* len){
     *frame = (char*)calloc(*len, sizeof(char));
     memcpy(*frame,&header,sizeof(struct ether_header));
     memcpy(*frame+sizeof(struct ether_header),&req,sizeof(struct ether_arp));
+    return;
+    
+arp_error:
+    *frame = NULL;
+    *len = 0;
+    if(fd != -1){
+        close(fd);
+    }
+    return;      
 }
 
 static void *
@@ -721,13 +740,21 @@ f_test_body(void *_f)
 	t->id == 0 || t->id == 3 ? "prod" : "cons", t->id);
     my_td_init(t);
     d = t->data;
+    
+    if(t->id == 0 || t->id == 3){
+        /* only the producers must create the arp frame */
+        generate_arp_frame(&arp_frame, &arp_len);
+        if(arp_frame == NULL){
+            D("Error generating ARP frame. Switching to simulated queue filling");
+        } else {
+            t->pkt_len = arp_len;
+        }
+        D("frame len = %d bytes",t->pkt_len);
+    }
+    
     t->ready = 1;
     D("now thread %d ready", t->id);
     /* body */
-    
-    generate_arp_frame(&arp_frame, &arp_len);
-    t->pkt_len = arp_len;
-    D("arp frame len = %d",arp_len);
 
     D("---- running in mode %d id %d store %p -------", mode, t->id, q->store);
     while (t->ready && d->stop < 100) {
@@ -792,7 +819,9 @@ f_test_body(void *_f)
 		ND("write at %p", h);
 		*h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, t->pkt_len};
                 
-                memcpy(h+1,arp_frame,t->pkt_len);
+                if(arp_frame!=NULL){
+                    memcpy(h+1,arp_frame,t->pkt_len);
+                }
                 /*D("RRR - write data to queue (%d bytes): ",t->pkt_len);
                 print_bytes((unsigned char*)(h+1),t->pkt_len);*/
 		//memset(h+1, 'z', t->pkt_len);
