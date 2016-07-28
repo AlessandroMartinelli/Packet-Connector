@@ -306,7 +306,7 @@ f_pcap_body(void *_f){
     struct my_td *t = _f;
     char errbuf[PCAP_ERRBUF_SIZE];
     struct pconn_state *f = t->parent;
-    char *device;
+    const char *device;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
@@ -324,11 +324,15 @@ f_pcap_body(void *_f){
         t->listen_fd = -1;
         device = f->port[t->id].name + 5; /* move beyond "pcap:" */
 	
-        t->pcap_fd = (*(device) == '.') ?
+        if (*(device) == '.'){
+            D("pcap: opening offline file %s", device+2);
             /* e.g. pcap:./filename.ext */
-            pcap_open_offline(device+2, errbuf) :
+            t->pcap_fd = pcap_open_offline(device+2, errbuf);
+        } else {
             /* e.g. pcap:eth0 */
-            pcap_open_live(device, BUFSIZ, 1, 1000, errbuf);
+            D("pcap: opening live device %s", device);
+            t->pcap_fd = pcap_open_live(device, BUFSIZ, 1, 1000, errbuf);
+        }
         
         if (t->pcap_fd == NULL) {
             D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
