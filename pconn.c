@@ -122,7 +122,7 @@ usage(void)
 
 
 static void
-td_wait_clients_ready(struct pconn_state *f)
+td_wait_ready(struct pconn_state *f)
 {
     uint32_t i;
 
@@ -136,16 +136,6 @@ td_wait_clients_ready(struct pconn_state *f)
         i++;
     }
     D("+++ main threads ready");
-}
-
-static int
-td_wait_ready(struct my_td *t){
-    int tmp;
-    while(tmp = t->ready, tmp == 0){
-        usleep(1000);
-    }
-    D("my twin said me: ready=%d",tmp);
-    return tmp;
 }
 
 /*
@@ -411,15 +401,11 @@ f_pcap_body(void *_f){
 	if (f->n_chains == 2) {
 	    t->twin->pcap_fd = t->pcap_fd;
             t->twin->ready = 1;
+            pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
 	}
-    } else {
-        //the twin must wait until its brother hasn't set the pcap_fd
-        if(td_wait_ready(t) == 2){
-            return NULL;
-        }
     }
 
-    td_wait_clients_ready(t->parent); /* wait for client threads to be ready */
+    td_wait_ready(t->parent); /* wait for client threads to be ready */
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
 	D("+++ start reading from input pcap, id %d q %p ready %d", t->id, t->q, t->ready);
         /* pcap_loop(), differently from pcap_dispatch(), doesn't return when the
@@ -432,6 +418,7 @@ f_pcap_body(void *_f){
     }
     t->ready = t->twin->ready = 2;
     if (t->id < 2 && f->n_chains == 2) {
+        D("Thread %d: JOIN twin thread %d, %s", t->id, t->twin->id, t->twin->name);
         pthread_join(t->twin->td_id, NULL);
     }
     return NULL;
@@ -588,10 +575,9 @@ f_tcp_body(void *_f)
     D("start thread %d", t->id);
     /* complete initialization */
     
-    t->listen_fd = -1;
-    
     if (t->id < 2) { /* first and second open the tcp connection */
         int client = 1;
+        t->listen_fd = -1;
 	
 	t->fd = do_socket(f->port[t->id].name + 4, 0, &client); // client Names start with tcp:
 	if (t->fd < 0) {
@@ -608,12 +594,12 @@ f_tcp_body(void *_f)
 	if (f->n_chains == 2) {
 	    t->twin->fd = t->fd;
 	    t->twin->listen_fd = t->listen_fd;
-	    // pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
             t->twin->ready = 1;
+	    pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
 	}
     }
 
-    td_wait_clients_ready(t->parent); /* wait for client threads to be ready */
+    td_wait_ready(t->parent); /* wait for client threads to be ready */
     if (t->listen_fd == -1) { /* client mode, connect and done */
 	D("-- running %d in client mode", t->id);
 	cb(t);
@@ -636,6 +622,7 @@ f_tcp_body(void *_f)
 	}
     }
     if (t->id < 2 && f->n_chains == 2) {
+        D("Thread %d: JOIN twin thread %d, %s", t->id, t->twin->id, t->twin->name);
         pthread_join(t->twin->td_id, NULL);
     }
     return NULL;
@@ -740,6 +727,10 @@ f_test_body(void *_f)
 	t->id == 0 || t->id == 3 ? "prod" : "cons", t->id);
     my_td_init(t);
     d = t->data;
+    
+    if(t->id < 2) {/*first 2 threads initialize second chain */
+        pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
+    }
     
     if(t->id == 0 || t->id == 3){
         /* only the producers must create the arp frame */
@@ -940,7 +931,7 @@ main(int ac, char **av)
     for (i = 0; i < f->n_chains; i++) { /* create one queue per chain */
 	t[2*i].q = t[2*i+1].q = f->q[i] = pcq_new(f->qlen, f->obj_size);
     }
-    for (i = 0; i < 2*f->n_chains; i++) { /* create one thread per endpoint */
+    for (i = 0; i < 2; i++) { /* create one thread per endpoint */
 	t[i].core = f->base_core + i;
 	pthread_create(&t[i].td_id, NULL, t[i].handler, t+i);
     }
@@ -955,7 +946,7 @@ main(int ac, char **av)
                 t[i].pr_stat(&t[i]);
             }
 	    if (t[i].ready == 2) { /* complete */
-		D("JOIN thread %d, %s", i, t[i].name);
+		D("Thread main: JOIN thread %d, %s", i, t[i].name);
 		pthread_join(t[i].td_id, NULL);
                 t[i].ready = 3;
             }
