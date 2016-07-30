@@ -115,7 +115,7 @@ usage(void)
 {
     D("\n\n\tUSAGE: %s [-c BASE_CORE] [-l PKT_LEN] [-m MODE] [-q Q_LEN] [-v] [-2]"
             " port1 port2\n"
-        "\t * port can be netmap:*, vale*, pcap:device, pcap:./file_path or tcp:host:port\n"
+        "\t * port can be netmap:*, vale*, pcap:device or tcp:host:port\n"
         "\t * host and port are resolved with the resolver", g_argv[0]);
     exit(1);
 }
@@ -137,7 +137,6 @@ td_wait_ready(struct pconn_state *f)
     }
     D("+++ main threads ready");
 }
-
 
 /*
  * The main function (id < 2) does the open,
@@ -189,6 +188,57 @@ f_netmap_body(void *_f)
 	};
 
 */
+
+/**************** callback methods for f_generalized_write() ****************/
+/* NOTE: all return negative value in case of error, except finalize        */
+
+int pcap_packet_inject(struct my_td *t, char* buf, int len){
+    return pcap_inject(t->pcap_fd, buf, len);
+}
+
+int tcp_packet_inject(struct my_td *t, char* buf, int len){
+    (void)t;
+    (void)buf;
+    (void)len;
+    
+    return 0;
+}
+
+int pcap_data_inject(struct my_td *t, char* buf, int len){
+    (void)t;
+    (void)buf;
+    (void)len;
+    
+    return 0;
+}
+
+int tcp_data_inject(struct my_td *t, char* buf, int len){
+    int cur;
+    cur = safe_write(t->fd, buf, len);
+    if (cur != len) { // short write, circuit closed
+        RD(5, "short write want %d have %d", len, cur);
+        return -1;
+    }
+    return 0;
+}
+
+void tcp_finalize(struct my_td *t){
+    D("WWW (thread %d) closing fd",t->id);
+    close(t->fd);
+    t->fd = t->twin->fd = -1;
+}
+
+void pcap_finalize(struct my_td *t){
+    D("WWW (thread %d) closing pcap_fd",t->id);
+    //threads 0 and 1 close the pcap stream
+    if(t->id == 0 || t->id == 1){
+        pcap_close(t->pcap_fd);
+    }
+}
+
+/****************************************************************************/
+
+
 /* Callback to read from an interface with pcap
  */
 void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
@@ -200,20 +250,21 @@ void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
         pcap_breakloop(t->pcap_fd);
         
         D("WWW closing fd, local %d", q->prod_pi);
-        pcap_close(t->pcap_fd); //TODO_ST: handle critical run.. maybe semaphores?
-        t->pcap_fd = t->twin->pcap_fd = NULL; /* same side */
+        /*pcap_close(t->pcap_fd); //TODO_ST: handle critical run.. maybe semaphores?
+        t->pcap_fd = t->twin->pcap_fd = NULL; //same side */
+        pcap_finalize(t);
     }
 
     char *buf = (char *)(q->store);
     struct test_t *d = t->data;   
-    int avail;  //TODO_ST: is it useful? not used at the moment.
+    //int avail;  //TODO_ST: is it useful? not used at the moment.
     struct q_pkt_hdr *h; /* h points to a descriptor at buf + prod_pi */
     
     /*D("header len: %d, header caplen: %d; prod_pi: %d; public_prod_pi; %d", header->len, 
             header->caplen, q->prod_pi, q->__prod_index);*/    //TODO_ST: len or caplen? correct also lines 210-211
     
     need = q_pad(sizeof(*h) + header->caplen);
-    avail = pcq_wait_space(q, need);
+    /*avail = */pcq_wait_space(q, need);
     h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
     *h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, header->caplen};
     memcpy(h+1, packet, header->caplen);
@@ -227,11 +278,16 @@ void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
     pcq_prod_advance(q, need, true);
 }
 
+/* This function read data from the queue and write onto a specific device
+ * through the use of 3 different callbacks, that could be customized depending
+ * on the interface we are using.
+ */
 static void *
-f_pcap_write(struct my_td *t) {
+f_generalized_write(struct my_td *t) {
     struct pcq_t *q = t->q;
     char *buf = (char *) (q->store);
     struct test_t *d = t->data;
+    int ret;
 
     while (t->ready == 1) {
         struct q_pkt_hdr *h;
@@ -249,7 +305,11 @@ f_pcap_write(struct my_td *t) {
             //send the packet in the interface 
             /*D("WWW - Write to device: (%d bytes) ", h->len);
             print_bytes((unsigned char*) (buf + sizeof(*h) + pcq_ofs(q, cur)), h->len);*/
-            pcap_inject(t->pcap_fd, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);  //TODO_ST: usare puntatori a funzione per generalizzare
+            ret = t->inject_single_packet(t, buf + sizeof(*h) + pcq_ofs(q, cur), h->len);
+            if(ret<0){
+                t->ready = 2;   //TODO_ST: is it right to go to state 2?
+                break;
+            }
             d->pctr += 1;
 
             // XXX optional check type 
@@ -276,13 +336,18 @@ f_pcap_write(struct my_td *t) {
             D("should not happen, empty block ?");
             continue;
         }
+        
+        ret = t->inject_multiple_data(t, buf + pcq_ofs(q, q->cons_ci), need);
+        if(ret<0){
+            break;
+        }
+        
         d->bctr += need;
         //d->pctr += 1;//TODO_ST: maybe this increment must be moved into the inner while 
         pcq_cons_advance(q, need); /* lazy notify */
     }
-    D("WWW closing pcap_fd");
-    pcap_close(t->pcap_fd);
-    t->pcap_fd = t->twin->pcap_fd = NULL;
+    
+    t->inject_finalize(t);
     return NULL;
 }
 
@@ -299,8 +364,7 @@ f_pcap_write(struct my_td *t) {
 static void *
 f_pcap_body(void *_f){
 #ifndef WITH_PCAP
-    (void)f;
-    (void)t;
+    (void)_f;
     D("pcap unsupported");
 #else
     struct my_td *t = _f;
@@ -317,6 +381,12 @@ f_pcap_body(void *_f){
 	t->ready = t->peer->ready = 2;
 	return NULL;
     }
+    
+    //initializes function pointers
+    t->inject_single_packet = pcap_packet_inject;
+    t->inject_multiple_data = pcap_data_inject;
+    t->inject_finalize = pcap_finalize;
+    
     D("start thread %d", t->id);
     /* complete initialization */
 
@@ -337,19 +407,17 @@ f_pcap_body(void *_f){
         if (t->pcap_fd == NULL) {
             D("Couldn't open device %s: %s\n", f->port[t->id].name, errbuf);
             t->ready = t->twin->ready = 2;
-            if (t->id < 2 && f->n_chains == 2) {
-                pthread_join(t->twin->td_id, NULL);
-            }
             return NULL;
         }
 	t->ready = 1;
 	if (f->n_chains == 2) {
 	    t->twin->pcap_fd = t->pcap_fd;
             t->twin->ready = 1;
+            pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
 	}
     }
 
-    td_wait_ready(t->parent); /* wait for all the threads to be ready */
+    td_wait_ready(t->parent); /* wait for client threads to be ready */
     if (t->id == 0 || t->id == 3) { /* producer reads packets and pull in queue */
 	D("+++ start reading from input pcap, id %d q %p ready %d", t->id, t->q, t->ready);
         /* pcap_loop(), differently from pcap_dispatch(), doesn't return when the
@@ -358,10 +426,11 @@ f_pcap_body(void *_f){
          */
         pcap_loop(t->pcap_fd, -1, f_pcap_read, (u_char*) t);
     } else { /* consumer writes packets into device */
-        f_pcap_write(t);
+        f_generalized_write(t);
     }
     t->ready = t->twin->ready = 2;
     if (t->id < 2 && f->n_chains == 2) {
+        D("Thread %d: JOIN twin thread %d, %s", t->id, t->twin->id, t->twin->name);
         pthread_join(t->twin->td_id, NULL);
     }
     return NULL;
@@ -426,6 +495,8 @@ f_tcp_read(struct my_td *t)
 /*
  * read from queue, push to tcp
  */
+
+#if 0
 static void *
 f_tcp_write(struct my_td *t)
 {
@@ -484,6 +555,7 @@ f_tcp_write(struct my_td *t)
     t->fd = t->twin->fd = -1;
     return NULL;
 }
+#endif
 
 /* Behaviour of tcp threads
  * 1) Only first 2 threads open a socket (shared with twin in bidirectional mode)
@@ -495,7 +567,7 @@ f_tcp_body(void *_f)
 {
     struct my_td *t = _f;
     struct pconn_state *f = t->parent;
-    void *(*cb)(struct my_td *) = (t->id == 0 || t->id == 3) ? f_tcp_read : f_tcp_write;
+    void *(*cb)(struct my_td *) = (t->id == 0 || t->id == 3) ? f_tcp_read : f_generalized_write;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
@@ -506,15 +578,23 @@ f_tcp_body(void *_f)
 	t->ready = t->peer->ready = 2;
 	return NULL;
     }
+    
+    //initializes function pointers
+    t->inject_single_packet = tcp_packet_inject;
+    t->inject_multiple_data = tcp_data_inject;
+    t->inject_finalize = tcp_finalize;
+    
     D("start thread %d", t->id);
     /* complete initialization */
-
+    
     if (t->id < 2) { /* first and second open the tcp connection */
         int client = 1;
-	t->listen_fd = -1;
+        t->listen_fd = -1;
+	
 	t->fd = do_socket(f->port[t->id].name + 4, 0, &client); // client Names start with tcp:
 	if (t->fd < 0) {
 	    D("*** cannot to %s", f->port[t->id].name);
+            t->ready = t->twin->ready = 2;
 	    return NULL;
 	}
 	D("mode for %d is %s", t->id, client ? "client" : "server");
@@ -526,8 +606,8 @@ f_tcp_body(void *_f)
 	if (f->n_chains == 2) {
 	    t->twin->fd = t->fd;
 	    t->twin->listen_fd = t->listen_fd;
-	    // pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
             t->twin->ready = 1;
+	    pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
 	}
     }
 
@@ -554,13 +634,14 @@ f_tcp_body(void *_f)
 	}
     }
     if (t->id < 2 && f->n_chains == 2) {
+        D("Thread %d: JOIN twin thread %d, %s", t->id, t->twin->id, t->twin->name);
         pthread_join(t->twin->td_id, NULL);
     }
     return NULL;
 }
 
 void generate_arp_frame(char** frame, int* len){
-    
+    int fd = -1;
     const char* target_ip_string="1.2.3.4";
     const char* if_name="veth0";
     // Construct Ethernet header (except for source MAC address).
@@ -581,8 +662,8 @@ void generate_arp_frame(char** frame, int* len){
     // Convert target IP address from string, copy into ARP request.
     struct in_addr target_ip_addr={0};
     if (!inet_aton(target_ip_string,&target_ip_addr)) {
-       fprintf(stderr,"%s is not a valid IP address",target_ip_string);
-       exit(1);
+       D("ARP generation: %s is not a valid IP address",target_ip_string);
+       goto arp_error;
     }
     memcpy(&req.arp_tpa,&target_ip_addr.s_addr,sizeof(req.arp_tpa));
 
@@ -594,36 +675,33 @@ void generate_arp_frame(char** frame, int* len){
         memcpy(ifr.ifr_name,if_name,if_name_len);
         ifr.ifr_name[if_name_len]=0;
     } else {
-        fprintf(stderr,"interface name is too long");
-        exit(1);
+        D("ARP generation: interface name is too long");
+        goto arp_error;
     }
 
     // Open an IPv4-family socket for use when calling ioctl.
-    int fd=socket(AF_INET,SOCK_DGRAM,0);
+    fd=socket(AF_INET,SOCK_DGRAM,0);
     if (fd==-1) {
-        perror(0);
-        exit(1);
+        D("ARP generation: error opening socket");
+        goto arp_error;
     }
 
     // Obtain the source IP address, copy into ARP request
     if (ioctl(fd,SIOCGIFADDR,&ifr)==-1) {
-        perror(0);
-        close(fd);
-        exit(1);
+        D("ARP generation: error obtaining IP address");
+        goto arp_error;
     }
     struct sockaddr_in* source_ip_addr = (struct sockaddr_in*)&ifr.ifr_addr;
     memcpy(&req.arp_spa,&source_ip_addr->sin_addr.s_addr,sizeof(req.arp_spa));
 
     // Obtain the source MAC address, copy into Ethernet header and ARP request.
     if (ioctl(fd,SIOCGIFHWADDR,&ifr)==-1) {
-        perror(0);
-        close(fd);
-        exit(1);
+        D("ARP generation: error obtaining MAC address");
+        goto arp_error;
     }
     if (ifr.ifr_hwaddr.sa_family!=ARPHRD_ETHER) {
-        fprintf(stderr,"not an Ethernet interface");
-        close(fd);
-        exit(1);
+        D("ARP generation: not an Ethernet interface");
+        goto arp_error;
     }
     const unsigned char* source_mac_addr=(unsigned char*)ifr.ifr_hwaddr.sa_data;
     memcpy(header.ether_shost,source_mac_addr,sizeof(header.ether_shost));
@@ -635,6 +713,15 @@ void generate_arp_frame(char** frame, int* len){
     *frame = (char*)calloc(*len, sizeof(char));
     memcpy(*frame,&header,sizeof(struct ether_header));
     memcpy(*frame+sizeof(struct ether_header),&req,sizeof(struct ether_arp));
+    return;
+    
+arp_error:
+    *frame = NULL;
+    *len = 0;
+    if(fd != -1){
+        close(fd);
+    }
+    return;      
 }
 
 static void *
@@ -652,13 +739,25 @@ f_test_body(void *_f)
 	t->id == 0 || t->id == 3 ? "prod" : "cons", t->id);
     my_td_init(t);
     d = t->data;
+    
+    if(t->id < 2 && f->n_chains == 2) {/*first 2 threads initialize second chain */
+        pthread_create(&t[2].td_id, NULL, t[0].handler, t+2);
+    }
+    
+    if(t->id == 0 || t->id == 3){
+        /* only the producers must create the arp frame */
+        generate_arp_frame(&arp_frame, &arp_len);
+        if(arp_frame == NULL){
+            D("Error generating ARP frame. Switching to simulated queue filling");
+        } else {
+            t->pkt_len = arp_len;
+        }
+        D("frame len = %d bytes",t->pkt_len);
+    }
+    
     t->ready = 1;
     D("now thread %d ready", t->id);
     /* body */
-    
-    generate_arp_frame(&arp_frame, &arp_len);
-    t->pkt_len = arp_len;
-    D("arp frame len = %d",arp_len);
 
     D("---- running in mode %d id %d store %p -------", mode, t->id, q->store);
     while (t->ready && d->stop < 100) {
@@ -703,7 +802,7 @@ f_test_body(void *_f)
 		break;
 	    }
 	} else { /* producer */
-	    index_t want, avail;
+	    index_t want/*, avail*/;
 	    h = (struct q_pkt_hdr *)(buf + pcq_ofs(q, q->prod_pi));
 
 	    switch (mode) {
@@ -719,11 +818,13 @@ f_test_body(void *_f)
 
 	    case 3: /* write a packet */
 		want = q_pad(sizeof(*h) + t->pkt_len);
-		avail = pcq_wait_space(d->q, want);
+		/*avail = */pcq_wait_space(d->q, want);
 		ND("write at %p", h);
 		*h = (struct q_pkt_hdr){ d->pctr, H_TY_DATA, t->pkt_len};
                 
-                memcpy(h+1,arp_frame,t->pkt_len);
+                if(arp_frame!=NULL){
+                    memcpy(h+1,arp_frame,t->pkt_len);
+                }
                 /*D("RRR - write data to queue (%d bytes): ",t->pkt_len);
                 print_bytes((unsigned char*)(h+1),t->pkt_len);*/
 		//memset(h+1, 'z', t->pkt_len);
@@ -842,7 +943,7 @@ main(int ac, char **av)
     for (i = 0; i < f->n_chains; i++) { /* create one queue per chain */
 	t[2*i].q = t[2*i+1].q = f->q[i] = pcq_new(f->qlen, f->obj_size);
     }
-    for (i = 0; i < 2*f->n_chains; i++) { /* create one thread per endpoint */
+    for (i = 0; i < 2; i++) { /* create one thread per endpoint */
 	t[i].core = f->base_core + i;
 	pthread_create(&t[i].td_id, NULL, t[i].handler, t+i);
     }
@@ -857,7 +958,7 @@ main(int ac, char **av)
                 t[i].pr_stat(&t[i]);
             }
 	    if (t[i].ready == 2) { /* complete */
-		D("JOIN thread %d, %s", i, t[i].name);
+		D("Thread main: JOIN thread %d, %s", i, t[i].name);
 		pthread_join(t[i].td_id, NULL);
                 t[i].ready = 3;
             }
