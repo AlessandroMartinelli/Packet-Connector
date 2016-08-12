@@ -249,7 +249,8 @@ struct my_td { /* per thread info */
     int listen_fd;
     int fd;
     
-    pcap_t* pcap_fd;
+    pcap_t *pcap_fd;
+    pcap_dumper_t *pcap_dumper;
 
     struct pcq_t *q; /* in or out */
 };

@@ -193,7 +193,33 @@ f_netmap_body(void *_f)
 /* NOTE: all return negative value in case of error, except finalize        */
 
 int pcap_packet_inject(struct my_td *t, char* buf, int len){
-    return pcap_inject(t->pcap_fd, buf, len);
+    struct pcap_pkthdr header;
+    struct timeval now;
+    int ret;
+    
+    if(t->pcap_dumper){
+        /* offline mode */
+        gettimeofday(&now, NULL);
+        header = (struct pcap_pkthdr){now, len, len};
+        pcap_dump((u_char*)t->pcap_dumper, &header, (u_char*)buf);
+        return 1;
+    } else {
+        /* online mode */
+        
+        /* if packet is greater than MTU ignore it */
+        /* TODO_ST: this is a problem: in fact the pcap_inject cannot handle packets
+         * bigger than MTU, apparently
+         */
+        if (len > 1514) {
+            D("Captured packet size: %d; ignoring it", len);
+            return 1;
+        }
+        ret = pcap_inject(t->pcap_fd, buf, len);
+        if(ret < 0){
+            D("Thread %d: Inject returned %d: pcap error: %s",t->id, ret, pcap_geterr(t->pcap_fd));
+        }
+        return ret;
+    }
 }
 
 int tcp_packet_inject(struct my_td *t, char* buf, int len){
@@ -231,7 +257,11 @@ void tcp_finalize(struct my_td *t){
 void pcap_finalize(struct my_td *t){
     D("WWW (thread %d) closing pcap_fd",t->id);
     //threads 0 and 1 close the pcap stream
+    if(t->pcap_dumper) {
+        pcap_dump_close(t->pcap_dumper);
+    }
     if(t->id == 0 || t->id == 1){
+        D("closing pcap_fd: %p", t->pcap_fd);
         pcap_close(t->pcap_fd);
     }
 }
@@ -253,6 +283,7 @@ void f_pcap_read(u_char *arg, const struct pcap_pkthdr *header,
         /*pcap_close(t->pcap_fd); //TODO_ST: handle critical run.. maybe semaphores?
         t->pcap_fd = t->twin->pcap_fd = NULL; //same side */
         pcap_finalize(t);
+        return;
     }
 
     char *buf = (char *)(q->store);
@@ -333,7 +364,7 @@ f_generalized_write(struct my_td *t) {
         }
         need = cur - q->cons_ci; /* how many bytes to send */
         if (need == 0) {
-            D("should not happen, empty block ?");
+            D("thread %d: should not happen, empty block ?", t->id);
             continue;
         }
         
@@ -371,6 +402,7 @@ f_pcap_body(void *_f){
     char errbuf[PCAP_ERRBUF_SIZE];
     struct pconn_state *f = t->parent;
     const char *device;
+    char *pcap_out_filename;
 
     snprintf(t->name, sizeof(t->name) - 1, "%s%d",
 	t->id == 0 || t->id == 3 ? "read" : "write", t->id);
@@ -398,6 +430,26 @@ f_pcap_body(void *_f){
             D("pcap: opening offline file %s", device+2);
             /* e.g. pcap:./filename.ext */
             t->pcap_fd = pcap_open_offline(device+2, errbuf);
+            
+            /* Opens a file for dumping read values from the interface.
+             * This is done only when in offline mode, so that symmetry between
+             * inject and dispatch behaviors is always present (when in offline
+             * mode, both inject and dispatch work on files)
+             * 
+             * "read from" file will have name [filename].pcap, the one choosen as
+             * command line argument.
+             * "write to" file will have name out_[filename].pcap
+             */
+            pcap_out_filename = (char*)malloc(strlen(device+2) + 5);
+            sprintf(pcap_out_filename, "out_%s", device+2);
+            t->pcap_dumper = pcap_dump_open(t->pcap_fd, pcap_out_filename);
+            if(t->pcap_dumper == NULL){
+                D("Error opening %s for writing", pcap_out_filename);
+                t->ready = t->twin->ready = 2;
+                free(pcap_out_filename);
+                return NULL;
+            }
+            free(pcap_out_filename);
         } else {
             /* e.g. pcap:eth0 */
             D("pcap: opening live device %s", device);
